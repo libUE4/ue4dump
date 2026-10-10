@@ -59,7 +59,7 @@ public:
     {
         if (ptr == 0) return false;
         RegionInfo region(0, 0, false, false, false);
-        return _findRegion(ptr, &region) && region.readable && (ptr+len) <= region.end;
+        return _findRegion(ptr, &region) && (region.readable || region.writable) && (ptr+len) <= region.end;
     }
 
     inline bool isPtrWritable(uintptr_t ptr, size_t len = sizeof(void*))
@@ -165,7 +165,7 @@ public:
     {
         if (ptr == 0) return false;
         RegionInfo region(0, 0, false, false, false);
-        return _findRegion(ptr, &region) && region.readable && (ptr+len) <= region.end;
+        return _findRegion(ptr, &region) && (region.readable || region.writable) && (ptr+len) <= region.end;
     }
 
     inline bool isPtrWritable(uintptr_t ptr, size_t len = sizeof(void*))

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 #include "../UEGameProfile.hpp"
 using namespace UEMemory;
 
@@ -100,6 +102,233 @@ public:
 
     uintptr_t GetPhysx() const override
     {
+        struct TArrayView
+        {
+            uintptr_t data = 0;
+            int32_t count = 0;
+            int32_t max = 0;
+        };
+
+        constexpr uintptr_t kSceneArrayOffset = 0x8;
+        constexpr uintptr_t kSceneRigidActorsOffset = 0x2568;
+        constexpr uintptr_t kActorTypeOffset = 0x8;
+        constexpr int kMinPhysxScore = 18;
+        constexpr int kStrongPhysxScore = 80;
+
+        auto isPossibleUserPtr = [](uintptr_t ptr) -> bool {
+            return ptr >= 0x10000 && ptr < 0x8000000000ULL && (ptr % sizeof(uintptr_t)) == 0;
+        };
+
+        auto isReadablePtr = [&](uintptr_t ptr, size_t len = sizeof(uintptr_t)) -> bool {
+            return isPossibleUserPtr(ptr) && kPtrValidator.isPtrReadable(ptr, len);
+        };
+
+        auto readArray = [&](uintptr_t address, TArrayView &out) -> bool {
+            return kPtrValidator.isPtrReadable(address, sizeof(TArrayView)) &&
+                   vm_rpm_ptr((void *)address, &out, sizeof(out));
+        };
+
+        auto isValidArray = [&](const TArrayView &arr, int32_t maxLimit) -> bool {
+            if (!isReadablePtr(arr.data))
+                return false;
+            if (arr.count <= 0 || arr.max <= 0 || arr.count > arr.max || arr.max > maxLimit)
+                return false;
+
+            int32_t checkCount = arr.count < 4 ? arr.count : 4;
+            return kPtrValidator.isPtrReadable(arr.data, static_cast<size_t>(checkCount) * sizeof(uintptr_t));
+        };
+
+        auto scoreActorArray = [&](const TArrayView &actors) -> int {
+            if (!isValidArray(actors, 0x20000))
+                return 0;
+
+            int sampleCount = actors.count < 64 ? actors.count : 64;
+            std::vector<uintptr_t> actorPtrs(static_cast<size_t>(sampleCount));
+            if (!vm_rpm_ptr((void *)actors.data, actorPtrs.data(), actorPtrs.size() * sizeof(uintptr_t)))
+                return 0;
+
+            int readableActors = 0;
+            int typeHits = 0;
+            int dynamicHits = 0;
+            int staticHits = 0;
+
+            for (uintptr_t actor : actorPtrs)
+            {
+                if (!isReadablePtr(actor + kActorTypeOffset, sizeof(uint16_t)))
+                    continue;
+
+                readableActors++;
+                uint16_t actorType = vm_rpm_ptr<uint16_t>((void *)(actor + kActorTypeOffset));
+                if (actorType == 6 || actorType == 7)
+                {
+                    typeHits++;
+                    if (actorType == 6) dynamicHits++;
+                    if (actorType == 7) staticHits++;
+                }
+            }
+
+            if (readableActors < 2 || typeHits < 2)
+                return 0;
+
+            int score = 8 + typeHits * 2;
+            if (dynamicHits > 0) score += 3;
+            if (staticHits > 0) score += 3;
+            if (typeHits * 2 >= readableActors) score += 4;
+            return score;
+        };
+
+        auto scoreScene = [&](uintptr_t scene) -> int {
+            if (!isReadablePtr(scene + kSceneRigidActorsOffset, sizeof(TArrayView)))
+                return 0;
+
+            TArrayView actors{};
+            if (!readArray(scene + kSceneRigidActorsOffset, actors))
+                return 0;
+
+            int actorScore = scoreActorArray(actors);
+            if (actorScore == 0)
+                return 0;
+
+            return 6 + actorScore;
+        };
+
+        auto scorePhysxInstance = [&](uintptr_t physx) -> int {
+            if (!isReadablePtr(physx + kSceneArrayOffset, sizeof(TArrayView)))
+                return 0;
+
+            TArrayView scenes{};
+            if (!readArray(physx + kSceneArrayOffset, scenes) || !isValidArray(scenes, 64))
+                return 0;
+
+            int checkedScenes = scenes.count < 4 ? scenes.count : 4;
+            uintptr_t scenePtrs[4] = {};
+            if (!vm_rpm_ptr((void *)scenes.data, scenePtrs, static_cast<size_t>(checkedScenes) * sizeof(uintptr_t)))
+                return 0;
+
+            int bestSceneScore = 0;
+            int sceneHits = 0;
+            for (int i = 0; i < checkedScenes; i++)
+            {
+                int sceneScore = scoreScene(scenePtrs[i]);
+                if (sceneScore > 0)
+                {
+                    sceneHits++;
+                    if (sceneScore > bestSceneScore)
+                        bestSceneScore = sceneScore;
+                }
+            }
+
+            if (sceneHits == 0)
+                return 0;
+
+            return 8 + bestSceneScore + sceneHits * 4;
+        };
+
+        auto scorePhysxSlot = [&](uintptr_t slot) -> int {
+            if (!kPtrValidator.isPtrReadable(slot, sizeof(uintptr_t)))
+                return 0;
+
+            uintptr_t physx = vm_rpm_ptr<uintptr_t>((void *)slot);
+            if (!isReadablePtr(physx + kSceneArrayOffset, sizeof(TArrayView)))
+                return 0;
+
+            return scorePhysxInstance(physx);
+        };
+
+        auto reportPhysx = [&](const char *source, uintptr_t slot, int score) -> uintptr_t {
+            uintptr_t base = GetUEVars()->GetBaseAddress();
+            uintptr_t physx = vm_rpm_ptr<uintptr_t>((void *)slot);
+            LOGI("[PUBGMHD] Physx %s found: slot=0x%lx rva=0x%lx instance=0x%lx score=%d",
+                 source,
+                 static_cast<unsigned long>(slot),
+                 static_cast<unsigned long>(slot - base),
+                 static_cast<unsigned long>(physx),
+                 score);
+            return slot;
+        };
+
+        auto findPhysxByStructure = [&]() -> uintptr_t {
+            ElfScanner ueElf = GetUnrealELF();
+            std::vector<KittyMemoryEx::ProcMap> scanSegments;
+
+            auto addSegment = [&](const KittyMemoryEx::ProcMap &seg) {
+                if (!seg.readable || !seg.writeable || !seg.is_private)
+                    return;
+
+                if (seg.endAddress <= seg.startAddress || seg.length < sizeof(uintptr_t))
+                    return;
+
+                bool exists = false;
+                for (const auto &known : scanSegments)
+                {
+                    if (known.startAddress == seg.startAddress && known.endAddress == seg.endAddress)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                    scanSegments.push_back(seg);
+            };
+
+            for (const auto &seg : ueElf.bssSegments())
+            {
+                addSegment(seg);
+            }
+
+            for (const auto &seg : ueElf.segments())
+            {
+                addSegment(seg);
+            }
+
+            uintptr_t bestSlot = 0;
+            int bestScore = 0;
+            constexpr size_t kChunkSize = 0x100000;
+            std::vector<uint8_t> buffer(kChunkSize);
+
+            LOGI("[PUBGMHD] Physx structure scan start: segments=%zu", scanSegments.size());
+
+            for (const auto &seg : scanSegments)
+            {
+                for (uintptr_t cursor = seg.startAddress; cursor < seg.endAddress; cursor += kChunkSize)
+                {
+                    size_t toRead = seg.endAddress - cursor;
+                    if (toRead > kChunkSize) toRead = kChunkSize;
+                    if (toRead < sizeof(uintptr_t)) continue;
+                    if (!vm_rpm_ptr((void *)cursor, buffer.data(), toRead))
+                        continue;
+
+                    for (size_t off = 0; off + sizeof(uintptr_t) <= toRead; off += sizeof(uintptr_t))
+                    {
+                        uintptr_t physx = 0;
+                        std::memcpy(&physx, buffer.data() + off, sizeof(uintptr_t));
+                        if (!isPossibleUserPtr(physx))
+                            continue;
+
+                        uintptr_t slot = cursor + off;
+                        int score = scorePhysxSlot(slot);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestSlot = slot;
+                            LOGI("[PUBGMHD] Physx candidate: slot=0x%lx rva=0x%lx instance=0x%lx score=%d",
+                                 static_cast<unsigned long>(slot),
+                                 static_cast<unsigned long>(slot - GetUEVars()->GetBaseAddress()),
+                                 static_cast<unsigned long>(physx),
+                                 score);
+                            if (score >= kStrongPhysxScore)
+                                return reportPhysx("structure", bestSlot, bestScore);
+                        }
+                    }
+                }
+            }
+
+            return bestScore >= kMinPhysxScore ? reportPhysx("structure", bestSlot, bestScore) : 0;
+        };
+
+        uintptr_t structPhysx = findPhysxByStructure();
+        if (structPhysx) return structPhysx;
+
         std::vector<std::pair<std::string, int>> idaPatterns = {
             {"? ? ? B0 00 03 3F D6", 0x0},
         };
@@ -112,9 +341,11 @@ public:
             const int step = it.second;
 
             uintptr_t adrl = Arm64::Decode_ADRP_LDR(findIdaPattern(map_type, ida_pattern, step),0x20);
-            //printf("%lx\n", vm_rpm_ptr<uintptr_t>((void*)adrl));
-            if (adrl != 0) return adrl;
+            int score = scorePhysxSlot(adrl);
+            if (score >= kMinPhysxScore)
+                return reportPhysx("pattern", adrl, score);
         }
+
         return 0;
     }
     UE_Offsets *GetOffsets() const override

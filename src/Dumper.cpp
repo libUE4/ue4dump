@@ -1,5 +1,8 @@
 #include "Dumper.hpp"
 
+#include <algorithm>
+#include <cstring>
+
 #include <fmt/format.h>
 
 #include <nlohmann/json.hpp>
@@ -93,6 +96,317 @@ namespace
         }
 
         return fallbackIdx;
+    }
+
+    struct ObjectReferenceCandidate
+    {
+        uintptr_t slot = 0;
+        uintptr_t object = 0;
+        int score = 0;
+        std::string name;
+        std::string reason;
+    };
+
+    struct WorldLayoutProbe
+    {
+        const char *name = "";
+        uintptr_t persistentLevel = 0;
+        uintptr_t owningGameInstance = 0;
+        uintptr_t levelActors = 0;
+        uintptr_t gameInstanceLocalPlayers = 0;
+        uintptr_t localPlayerController = 0;
+        uintptr_t playerControllerPawn0 = 0;
+        uintptr_t playerControllerPawn1 = 0;
+        uintptr_t playerControllerCameraManager = 0;
+    };
+
+    bool ProfileHasAppId(const IGameProfile *profile, const char *appId)
+    {
+        if (!profile || !appId || !*appId)
+            return false;
+
+        for (const auto &id : profile->GetAppIDs())
+        {
+            if (id == appId)
+                return true;
+        }
+        return false;
+    }
+
+    bool IsReadablePtrValue(uintptr_t value)
+    {
+        return value >= 0x10000 && kPtrValidator.isPtrReadable((void *)value);
+    }
+
+    template <typename T>
+    bool ReadValue(uintptr_t address, T &out)
+    {
+        if (!address)
+            return false;
+        return vm_rpm_ptr((void *)address, &out, sizeof(T));
+    }
+
+    bool ReadReadablePtr(uintptr_t address, uintptr_t &out)
+    {
+        out = 0;
+        if (!ReadValue(address, out))
+            return false;
+        return IsReadablePtrValue(out);
+    }
+
+    void AppendReason(std::string &reason, const char *text)
+    {
+        if (!reason.empty())
+            reason += ", ";
+        reason += text;
+    }
+
+    void FindAlignedPointerReferences(uintptr_t start, size_t length, uintptr_t target,
+                                      std::vector<uintptr_t> &out, size_t maxRefs)
+    {
+        if (!start || !length || !target || out.size() >= maxRefs)
+            return;
+
+        const uintptr_t alignedStart = GetPtrAlignedOf(start);
+        const uintptr_t rawEnd = start + length;
+        const uintptr_t alignedEnd = rawEnd & ~(uintptr_t(sizeof(uintptr_t)) - 1);
+        if (alignedEnd <= alignedStart)
+            return;
+
+        constexpr size_t kChunkSize = 0x100000;
+        std::vector<uint8_t> buffer;
+        for (uintptr_t cursor = alignedStart;
+             cursor + sizeof(uintptr_t) <= alignedEnd && out.size() < maxRefs;)
+        {
+            size_t toRead = std::min<size_t>(kChunkSize, alignedEnd - cursor);
+            toRead &= ~(sizeof(uintptr_t) - 1);
+            if (toRead < sizeof(uintptr_t))
+                break;
+
+            buffer.resize(toRead);
+            if (vm_rpm_ptr((void *)cursor, buffer.data(), toRead))
+            {
+                for (size_t i = 0; i + sizeof(uintptr_t) <= toRead && out.size() < maxRefs;
+                     i += sizeof(uintptr_t))
+                {
+                    uintptr_t value = 0;
+                    std::memcpy(&value, buffer.data() + i, sizeof(value));
+                    if (value == target)
+                        out.push_back(cursor + i);
+                }
+            }
+
+            cursor += toRead;
+        }
+    }
+
+    int ScoreWorldLayout(uintptr_t world, const WorldLayoutProbe &layout, std::string &reason)
+    {
+        int score = 0;
+
+        uintptr_t level = 0;
+        if (ReadReadablePtr(world + layout.persistentLevel, level))
+        {
+            score += 30;
+            AppendReason(reason, "PersistentLevel");
+
+            uintptr_t actors = 0;
+            int32_t actorCount = 0;
+            const bool hasActors = ReadReadablePtr(level + layout.levelActors, actors);
+            const bool hasActorCount = ReadValue(level + layout.levelActors + sizeof(uintptr_t), actorCount);
+            if (hasActors && hasActorCount && actorCount > 0 && actorCount < 1000000)
+            {
+                score += 45;
+                AppendReason(reason, "Actors");
+            }
+        }
+
+        uintptr_t gameInstance = 0;
+        if (ReadReadablePtr(world + layout.owningGameInstance, gameInstance))
+        {
+            score += 35;
+            AppendReason(reason, "OwningGameInstance");
+
+            uintptr_t localPlayers = 0;
+            int32_t localPlayersNum = 0;
+            int32_t localPlayersMax = 0;
+            const bool hasLocalPlayers = ReadReadablePtr(gameInstance + layout.gameInstanceLocalPlayers,
+                                                         localPlayers);
+            const bool hasLocalPlayersNum = ReadValue(gameInstance + layout.gameInstanceLocalPlayers + sizeof(uintptr_t),
+                                                      localPlayersNum);
+            const bool hasLocalPlayersMax = ReadValue(gameInstance + layout.gameInstanceLocalPlayers + sizeof(uintptr_t) + sizeof(int32_t),
+                                                      localPlayersMax);
+            if (hasLocalPlayers && hasLocalPlayersNum && hasLocalPlayersMax &&
+                localPlayersNum > 0 && localPlayersNum <= 16 &&
+                localPlayersMax >= localPlayersNum && localPlayersMax <= 64)
+            {
+                score += 80;
+                AppendReason(reason, "LocalPlayers");
+
+                uintptr_t localPlayer = 0;
+                if (ReadReadablePtr(localPlayers, localPlayer))
+                {
+                    score += 20;
+                    AppendReason(reason, "LocalPlayer[0]");
+
+                    uintptr_t controller = 0;
+                    if (ReadReadablePtr(localPlayer + layout.localPlayerController, controller))
+                    {
+                        score += 40;
+                        AppendReason(reason, "PlayerController");
+
+                        uintptr_t pawn = 0;
+                        if ((layout.playerControllerPawn0 &&
+                             ReadReadablePtr(controller + layout.playerControllerPawn0, pawn)) ||
+                            (layout.playerControllerPawn1 &&
+                             ReadReadablePtr(controller + layout.playerControllerPawn1, pawn)))
+                        {
+                            score += 20;
+                            AppendReason(reason, "Pawn");
+                        }
+
+                        uintptr_t camera = 0;
+                        if (layout.playerControllerCameraManager &&
+                            ReadReadablePtr(controller + layout.playerControllerCameraManager, camera))
+                        {
+                            score += 20;
+                            AppendReason(reason, "CameraManager");
+                        }
+                    }
+                }
+            }
+        }
+
+        if (score > 0 && layout.name && *layout.name)
+        {
+            reason = std::string(layout.name) + ": " + reason;
+        }
+
+        return score;
+    }
+
+    void ScoreWorldCandidate(const IGameProfile *profile, ObjectReferenceCandidate &candidate)
+    {
+        candidate.score = 10;
+        candidate.reason = "referenced UObject";
+
+        std::vector<WorldLayoutProbe> layouts;
+        if (ProfileHasAppId(profile, "com.tencent.tmgp.dfm"))
+        {
+            layouts.push_back({
+                "DFM",
+                0xF8,   // UWorld::PersistentLevel
+                0x190,  // UWorld::OwningGameInstance
+                0x98,   // ULevel::Actors
+                0x38,   // UGameInstance::LocalPlayers
+                0x30,   // UPlayer::PlayerController
+                0x3F0,  // APlayerController::AcknowledgedPawn
+                0x3A0,  // DFM fallback pawn used by existing draw project
+                0x408,  // APlayerController::PlayerCameraManager
+            });
+        }
+
+        for (const auto &layout : layouts)
+        {
+            std::string reason;
+            const int score = ScoreWorldLayout(candidate.object, layout, reason);
+            if (score > candidate.score)
+            {
+                candidate.score = score;
+                candidate.reason = reason;
+            }
+        }
+    }
+
+    void AddObjectReferenceCandidates(const std::vector<KittyMemoryEx::ProcMap> &segments,
+                                      const UE_UObject &object,
+                                      std::vector<ObjectReferenceCandidate> &candidates,
+                                      size_t maxRefs)
+    {
+        std::vector<uintptr_t> refs;
+        for (auto it = segments.rbegin(); it != segments.rend() && refs.size() < maxRefs; ++it)
+        {
+            if (!it->writeable)
+                continue;
+            FindAlignedPointerReferences(it->startAddress, it->length,
+                                         uintptr_t(object.GetAddress()), refs, maxRefs);
+        }
+
+        for (uintptr_t ref : refs)
+        {
+            const auto exists = std::find_if(candidates.begin(), candidates.end(),
+                                             [ref](const ObjectReferenceCandidate &candidate)
+                                             {
+                                                 return candidate.slot == ref;
+                                             });
+            if (exists != candidates.end())
+                continue;
+
+            ObjectReferenceCandidate candidate{};
+            candidate.slot = ref;
+            candidate.object = uintptr_t(object.GetAddress());
+            candidate.name = object.GetFullName();
+            candidates.push_back(std::move(candidate));
+        }
+    }
+
+    void AddUniqueSegment(std::vector<KittyMemoryEx::ProcMap> &segments,
+                          const KittyMemoryEx::ProcMap &seg)
+    {
+        if (!seg.isValid() || !seg.writeable)
+            return;
+
+        for (const auto &existing : segments)
+        {
+            if (existing.startAddress == seg.startAddress && existing.endAddress == seg.endAddress)
+                return;
+        }
+        segments.push_back(seg);
+    }
+
+    std::vector<KittyMemoryEx::ProcMap> BuildWritableUESearchSegments(const ElfScanner &ueElf,
+                                                                      pid_t pid)
+    {
+        std::vector<KittyMemoryEx::ProcMap> segments;
+        if (!ueElf.isValid())
+            return segments;
+
+        uintptr_t moduleEnd = ueElf.base() + ueElf.loadSize();
+
+        // 先放 bss/写段。Android linker 会把部分 UE .bss 标成 [anon:.bss] / -w-p，
+        // GEngine/GWorld 这类全局指针常在这里，旧逻辑只扫 ELF segments 会漏。
+        for (const auto &seg : ueElf.bssSegments())
+        {
+            AddUniqueSegment(segments, seg);
+            if (seg.endAddress > moduleEnd)
+                moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+        }
+
+        for (const auto &seg : ueElf.segments())
+        {
+            AddUniqueSegment(segments, seg);
+            if (seg.endAddress > moduleEnd)
+                moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+        }
+
+        for (const auto &map : KittyMemoryEx::getAllMaps(pid))
+        {
+            if (!map.writeable)
+                continue;
+
+            const bool isUELibMap =
+                map.pathname.find("libUE4.so") != std::string::npos ||
+                map.pathname.find("libUnreal.so") != std::string::npos;
+            const bool isAnonBss = map.pathname.find("[anon:.bss]") != std::string::npos;
+            const bool nearUnreal =
+                ueElf.base() && map.startAddress >= ueElf.base() &&
+                map.startAddress < (moduleEnd + 0x08000000ULL);
+
+            if ((isUELibMap && map.writeable) || (isAnonBss && nearUnreal))
+                AddUniqueSegment(segments, map);
+        }
+
+        return segments;
     }
 }
 
@@ -286,11 +600,18 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uintptr_t NativeAndroidApp = _profile->GetUEVars()->GetNativeAndroidApp();
     uintptr_t ProcessEvent = _profile->GetUEVars()->GetProcessEvent();
     uintptr_t ProcessEventIdx = FindProcessEventIdx(ProcessEvent);
+    if (!ProcessEventIdx && ProcessEvent && ProcessEvent >= baseAddr &&
+        (ProcessEvent - baseAddr) == 0xE8B79F0)
+    {
+        ProcessEventIdx = 0x45;
+    }
     // Find UEngine & UWorld
     uintptr_t UEnginePtr = 0, UWorldPtr = 0;
     if (((UE_UObject)UEWrappers::GetObjects()->GetObjectPtr(1)).GetIndex() == 1)
     {
-        auto ueSegs = _profile->GetUnrealELF().segments();
+        const auto ueElf = _profile->GetUnrealELF();
+        auto ueSegs = BuildWritableUESearchSegments(ueElf, kMgr.processID());
+        logsBufferFmt.append("UE writable search ranges: {}\n", ueSegs.size());
 
         UE_UClass UEngineClass = UEWrappers::GetObjects()->FindObject("Class Engine.Engine").Cast<UE_UClass>();
         UE_UClass UWorldClass = UEWrappers::GetObjects()->FindObject("Class Engine.World").Cast<UE_UClass>();
@@ -301,7 +622,9 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
 
         if (UEngineClass || UWorldClass)
         {
-            UEWrappers::GetObjects()->ForEachObject([&ueSegs, &UEngineClass, &UWorldClass, &UEnginePtr, &UWorldPtr](UE_UObject object)
+            std::vector<ObjectReferenceCandidate> worldCandidates;
+
+            UEWrappers::GetObjects()->ForEachObject([&](UE_UObject object)
             {
                 if (!object.HasFlags(EObjectFlags::ClassDefaultObject))
                 {
@@ -309,25 +632,55 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
                     bool isUWorld = UWorldClass && object.IsA(UWorldClass);
                     if (!isUEngine && !isUWorld) return false;
 
+                    if (isUWorld)
+                    {
+                        AddObjectReferenceCandidates(ueSegs, object, worldCandidates, 64);
+                        return ((!UEngineClass || UEnginePtr != 0) &&
+                                (!UWorldClass || worldCandidates.size() >= 64));
+                    }
+
                     // reverse search, start with .bss
                     for (auto it = ueSegs.rbegin(); it != ueSegs.rend(); ++it)
                     {
-                        if (!it->is_rw) continue;
+                        if (!it->writeable) continue;
 
                         uintptr_t ptr = FindAlignedPointerRefrence(it->startAddress, it->length, object.GetAddress());
                         if (ptr != 0)
                         {
                             if (isUEngine && !UEnginePtr)
                                 UEnginePtr = ptr;
-                            else if (isUWorld && !UWorldPtr)
-                                UWorldPtr = ptr;
 
                             break;
                         }
                     }
                 }
-                return ((!UEngineClass || UEnginePtr != 0) && (!UWorldClass || UWorldPtr != 0));
+                return ((!UEngineClass || UEnginePtr != 0) &&
+                        (!UWorldClass || worldCandidates.size() >= 64));
             });
+
+            if (!worldCandidates.empty())
+            {
+                for (auto &candidate : worldCandidates)
+                    ScoreWorldCandidate(_profile, candidate);
+
+                std::stable_sort(worldCandidates.begin(), worldCandidates.end(),
+                                 [](const ObjectReferenceCandidate &lhs,
+                                    const ObjectReferenceCandidate &rhs)
+                                 {
+                                     return lhs.score > rhs.score;
+                                 });
+
+                const ObjectReferenceCandidate &best = worldCandidates.front();
+                UWorldPtr = best.slot;
+                logsBufferFmt.append("GWorld candidates: {}\n", worldCandidates.size());
+                for (size_t i = 0; i < std::min<size_t>(worldCandidates.size(), 8); ++i)
+                {
+                    const auto &candidate = worldCandidates[i];
+                    logsBufferFmt.append("  [{}] slot [<Base> + 0x{:X}] -> 0x{:X}, score {}, {}, {}\n",
+                                         i, candidate.slot - baseAddr, candidate.object,
+                                         candidate.score, candidate.name, candidate.reason);
+                }
+            }
         }
 
         if (!UEnginePtr)

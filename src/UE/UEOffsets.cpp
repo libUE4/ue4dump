@@ -805,6 +805,8 @@ std::string UEVars::InitStatusToStr(UEVarsInitStatus s)
         return "ERROR_LIB_INVALID_BASE";
     case UEVarsInitStatus::ERROR_LIB_NOT_FOUND:
         return "ERROR_LIB_NOT_FOUND";
+    case UEVarsInitStatus::ERROR_READ_MAPS:
+        return "ERROR_READ_MAPS";
     case UEVarsInitStatus::ERROR_IO_OPERATION:
         return "ERROR_IO_OPERATION";
     case UEVarsInitStatus::ERROR_INIT_GNAMES:

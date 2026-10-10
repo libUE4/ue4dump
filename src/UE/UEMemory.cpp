@@ -10,7 +10,7 @@ namespace UEMemory
 
     bool vm_rpm_ptr(const void *address, void *result, size_t len)
     {
-        if (!kPtrValidator.isPtrReadable(address))
+        if (!kPtrValidator.isPtrReadable(address, len))
             return false;
 
         return kMgr.readMem(uintptr_t(address), result, len) == len;

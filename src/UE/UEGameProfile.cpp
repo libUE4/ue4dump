@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstring>
 #include <initializer_list>
 #include <vector>
 
@@ -46,6 +48,74 @@ namespace
                 return true;
         }
         return false;
+    }
+
+    bool MatchXorBytes(const uint8_t *buf, size_t len, size_t off, const char *plain, uint8_t key)
+    {
+        const size_t plen = std::strlen(plain);
+        if (!buf || !plain || off + plen > len)
+            return false;
+
+        for (size_t i = 0; i < plen; ++i)
+        {
+            if (static_cast<uint8_t>(buf[off + i] ^ key) != static_cast<uint8_t>(plain[i]))
+                return false;
+        }
+        return true;
+    }
+
+    bool DetectStandardNameBlockXor(const uint8_t *firstBlock, size_t len, uint8_t *keyOut)
+    {
+        if (!firstBlock || len < 0x20)
+            return false;
+
+        // UE4.23/4.24 non case-preserving first block normally starts with:
+        // [FNameEntryHeader][None][FNameEntryHeader][ByteProperty].
+        // Some Tencent builds XOR only the string bytes, headers remain clear.
+        for (uint32_t key = 0; key <= 0xff; ++key)
+        {
+            const uint8_t k = static_cast<uint8_t>(key);
+            if (MatchXorBytes(firstBlock, len, 0x2, "None", k) &&
+                MatchXorBytes(firstBlock, len, 0x8, "ByteProperty", k))
+            {
+                if (keyOut) *keyOut = k;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    uint8_t DetectRuntimeFNameXorKey(uintptr_t namesPtr, const UE_Offsets *offsets)
+    {
+        static uintptr_t cachedNamesPtr = 0;
+        static uint8_t cachedKey = 0;
+        static bool cached = false;
+
+        if (cached && cachedNamesPtr == namesPtr)
+            return cachedKey;
+
+        cached = true;
+        cachedNamesPtr = namesPtr;
+        cachedKey = 0;
+
+        if (!namesPtr || !offsets || !offsets->FNamePool.BlocksOff)
+            return cachedKey;
+
+        const uintptr_t block0 = vm_rpm_ptr<uintptr_t>(
+            reinterpret_cast<void *>(namesPtr + offsets->FNamePool.BlocksOff));
+        if (!block0)
+            return cachedKey;
+
+        uint8_t firstBlock[0x40] = {};
+        uint8_t key = 0;
+        if (vm_rpm_ptr(reinterpret_cast<void *>(block0), firstBlock, sizeof(firstBlock)) &&
+            DetectStandardNameBlockXor(firstBlock, sizeof(firstBlock), &key))
+        {
+            cachedKey = key;
+        }
+
+        return cachedKey;
     }
 
     uintptr_t GetModuleReadableEnd(const ElfScanner &ue_elf)
@@ -549,7 +619,14 @@ UEVarsInitStatus IGameProfile::InitUEVars()
 {
     _UEVars = UEVars{};
 
-    bool is32Bit = KittyMemoryEx::getMapsEndWith(kMgr.processID(), "/linker64").empty();
+    auto processMaps = KittyMemoryEx::getAllMaps(kMgr.processID());
+    if (processMaps.empty())
+    {
+        LOGE("无法读取目标进程 maps，通常是 adb shell 没有 root/ptrace 权限。");
+        return UEVarsInitStatus::ERROR_READ_MAPS;
+    }
+
+    bool is32Bit = KittyMemoryEx::getMapsEndWith(processMaps, "/linker64").empty();
     if (is32Bit)
     {
         if (sizeof(void *) != 4)
@@ -761,7 +838,24 @@ std::string IGameProfile::GetNameEntryString(uint8_t *entry) const
         pStr = entry + offsets->FNamePoolEntry.Header + sizeof(int16_t);
     }
 
-    std::string result = vm_rpm_str(pStr, strLen);
+    std::string result;
+    if (IsUsingFNamePool())
+    {
+        std::vector<char> raw(strLen, '\0');
+        if (!vm_rpm_ptr(pStr, raw.data(), strLen))
+            return "";
+
+        const uint8_t xorKey = DetectRuntimeFNameXorKey(_UEVars.GetNamesPtr(), offsets);
+        result.reserve(strLen);
+        for (size_t i = 0; i < strLen; ++i)
+        {
+            result.push_back(static_cast<char>(static_cast<uint8_t>(raw[i]) ^ xorKey));
+        }
+    }
+    else
+    {
+        result = vm_rpm_str(pStr, strLen);
+    }
 
     if (strNumber > 0)
         result += '_' + std::to_string(strNumber - 1);
@@ -1001,11 +1095,142 @@ uintptr_t IGameProfile::GetNamesPtr() const
         return std::strncmp(s, "ByteProperty", 12) == 0;
     };
 
+    auto verifyFNamePoolAt = [&](uintptr_t poolBase, const char *tag) -> uintptr_t
+    {
+        if (!poolBase || !off->FNamePool.BlocksOff)
+            return 0;
+
+        const uintptr_t block0 = vm_rpm_ptr<uintptr_t>(
+            reinterpret_cast<void *>(poolBase + off->FNamePool.BlocksOff));
+        if (block0 < kMinPtr || block0 > kMaxPtr)
+            return 0;
+
+        uint8_t firstBlock[0x40] = {};
+        uint8_t xorKey = 0;
+        if (!vm_rpm_ptr(reinterpret_cast<void *>(block0), firstBlock, sizeof(firstBlock)) ||
+            !DetectStandardNameBlockXor(firstBlock, sizeof(firstBlock), &xorKey))
+        {
+            return 0;
+        }
+
+        if (xorKey)
+        {
+            LOGI("[Bootstrap] FNamePool @ 0x%lx (%s, block0=0x%lx, xor=0x%02x)",
+                 static_cast<unsigned long>(poolBase),
+                 tag ? tag : "direct",
+                 static_cast<unsigned long>(block0),
+                 static_cast<unsigned>(xorKey));
+        }
+        else
+        {
+            LOGI("[Bootstrap] FNamePool @ 0x%lx (%s, block0=0x%lx)",
+                 static_cast<unsigned long>(poolBase),
+                 tag ? tag : "direct",
+                 static_cast<unsigned long>(block0));
+        }
+        return poolBase;
+    };
+
+    if (HasAppId(this, "com.tencent.tmgp.nz"))
+    {
+        // 逆战：未来 UE4.24 当前版本：NamePoolData 位于 libUE4 基址 + 0x1e79f040。
+        // 先走已验证偏移，避免 IO 模式下大范围扫描超时；失败再回退通用扫描。
+        static constexpr uintptr_t kNZNamePoolOffsets[] = {
+            0x1e79f040ULL,
+        };
+        for (uintptr_t rel : kNZNamePoolOffsets)
+        {
+            if (uintptr_t found = verifyFNamePoolAt(ue_elf.base() + rel, "NZ fast path"))
+                return found;
+        }
+        LOGW("[Bootstrap] NZ fast path NamePool 未命中，回退通用扫描");
+    }
+
+    std::vector<KittyMemoryEx::ProcMap> searchSegments;
+    auto addSearchSegment = [&](const KittyMemoryEx::ProcMap &seg)
+    {
+        if (!seg.isValid() || !(seg.readable || seg.writeable))
+            return;
+
+        for (const auto &existing : searchSegments)
+        {
+            if (existing.startAddress == seg.startAddress && existing.endAddress == seg.endAddress)
+                return;
+        }
+        searchSegments.push_back(seg);
+    };
+
+    uintptr_t moduleEnd = ue_elf.base() + ue_elf.loadSize();
+    // 优先扫描可写/BSS：GNames/NamePoolData 通常在这里。IO 读取大段 r--/r-x
+    // 很慢，先命中全局对象可避免 MCP 超时。
+    for (const auto &seg : ue_elf.bssSegments())
+    {
+        addSearchSegment(seg);
+        if (seg.endAddress > moduleEnd)
+            moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+    }
     for (const auto &seg : ue_elf.segments())
     {
-        if (!seg.readable)
+        if (seg.writeable)
+            addSearchSegment(seg);
+        if (seg.endAddress > moduleEnd)
+            moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+    }
+
+    // 部分 Android 12+ / linker 映射会把 .bss 标成 "[anon:.bss]" 且权限为 -w-p。
+    // /proc/<pid>/mem/root 读取没问题，但旧逻辑只扫 readable ELF segment，会漏掉
+    // NamePoolData/GNames 这类全局对象。
+    for (const auto &map : KittyMemoryEx::getAllMaps(kMgr.processID()))
+    {
+        if (!(map.readable || map.writeable))
             continue;
 
+        const bool isUELibMap =
+            map.pathname.find("libUE4.so") != std::string::npos ||
+            map.pathname.find("libUnreal.so") != std::string::npos;
+        const bool isAnonBss = map.pathname.find("[anon:.bss]") != std::string::npos;
+        const bool nearUnreal =
+            ue_elf.base() && map.startAddress >= ue_elf.base() &&
+            map.startAddress < (moduleEnd + 0x08000000ULL);
+
+        if ((isUELibMap && map.writeable) || (isAnonBss && nearUnreal))
+            addSearchSegment(map);
+    }
+
+    // 最后才扫只读/可执行段作为兜底。
+    for (const auto &seg : ue_elf.segments())
+    {
+        if (!seg.writeable)
+            addSearchSegment(seg);
+        if (seg.endAddress > moduleEnd)
+            moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+    }
+
+    LOGI("[Bootstrap] GetNamesPtr: scanning %zu UE ranges (base=0x%lx end=0x%lx bss=%zu)",
+         searchSegments.size(),
+         static_cast<unsigned long>(ue_elf.base()),
+         static_cast<unsigned long>(moduleEnd),
+         ue_elf.bssSegments().size());
+
+    auto findNeedle = [](const uint8_t *buf, size_t len, const char *needle, size_t *posOut = nullptr) -> bool
+    {
+        const size_t nlen = std::strlen(needle);
+        if (!buf || !needle || nlen == 0 || len < nlen)
+            return false;
+
+        for (size_t i = 0; i + nlen <= len; ++i)
+        {
+            if (std::memcmp(buf + i, needle, nlen) == 0)
+            {
+                if (posOut) *posOut = i;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const auto &seg : searchSegments)
+    {
         std::vector<uint8_t> buf(kChunk);
         for (size_t base = 0; base + kPtrSize <= seg.length; base += kChunk)
         {
@@ -1027,15 +1252,52 @@ uintptr_t IGameProfile::GetNamesPtr() const
 
                 auto tryFNamePool = [&]() -> uintptr_t
                 {
-                    if (!vm_rpm_ptr((void *)(val + 0x8), strBuf0, 12) || !isByteProperty(strBuf0))
+                    bool looksLikeFirstNameBlock = false;
+                    uint8_t xorKey = 0;
+                    if (vm_rpm_ptr((void *)(val + 0x8), strBuf0, 12) && isByteProperty(strBuf0))
+                    {
+                        looksLikeFirstNameBlock = true;
+                    }
+                    else
+                    {
+                        uint8_t firstBlockProbe[0x200] = {};
+                        size_t noneOff = 0, byteOff = 0;
+                        if (vm_rpm_ptr((void *)val, firstBlockProbe, sizeof(firstBlockProbe)))
+                        {
+                            if (DetectStandardNameBlockXor(firstBlockProbe, sizeof(firstBlockProbe), &xorKey))
+                            {
+                                looksLikeFirstNameBlock = true;
+                            }
+                            else if (findNeedle(firstBlockProbe, sizeof(firstBlockProbe), "None", &noneOff) &&
+                                     findNeedle(firstBlockProbe, sizeof(firstBlockProbe), "ByteProperty", &byteOff) &&
+                                     noneOff <= 0x20 && byteOff <= 0x80 &&
+                                     (findNeedle(firstBlockProbe, sizeof(firstBlockProbe), "IntProperty") ||
+                                      findNeedle(firstBlockProbe, sizeof(firstBlockProbe), "BoolProperty")))
+                            {
+                                looksLikeFirstNameBlock = true;
+                            }
+                        }
+                    }
+
+                    if (!looksLikeFirstNameBlock)
                         return 0;
 
                     uintptr_t poolBase = candidate;
                     if (off->FNamePool.BlocksOff && candidate >= off->FNamePool.BlocksOff)
                         poolBase -= off->FNamePool.BlocksOff;
 
-                    LOGI("[Bootstrap] FNamePool @ 0x%lx (slot @ 0x%lx)",
-                         static_cast<unsigned long>(poolBase), static_cast<unsigned long>(candidate));
+                    if (xorKey)
+                    {
+                        LOGI("[Bootstrap] FNamePool @ 0x%lx (slot @ 0x%lx, xor=0x%02x)",
+                             static_cast<unsigned long>(poolBase),
+                             static_cast<unsigned long>(candidate),
+                             static_cast<unsigned>(xorKey));
+                    }
+                    else
+                    {
+                        LOGI("[Bootstrap] FNamePool @ 0x%lx (slot @ 0x%lx)",
+                             static_cast<unsigned long>(poolBase), static_cast<unsigned long>(candidate));
+                    }
                     return poolBase;
                 };
 
@@ -1111,9 +1373,50 @@ uintptr_t IGameProfile::GetNativeAndroidApp() const
     constexpr size_t kChunk = 0x100000;
     std::vector<uint8_t> buffer(kChunk);
 
+    std::vector<KittyMemoryEx::ProcMap> searchSegments;
+    auto addSegment = [&](const KittyMemoryEx::ProcMap &seg)
+    {
+        if (!seg.isValid() || !(seg.readable || seg.writeable))
+            return;
+
+        for (const auto &existing : searchSegments)
+        {
+            if (existing.startAddress == seg.startAddress && existing.endAddress == seg.endAddress)
+                return;
+        }
+        searchSegments.push_back(seg);
+    };
+
+    uintptr_t moduleEnd = ue_elf.base() + ue_elf.loadSize();
+    for (const auto &seg : ue_elf.bssSegments())
+    {
+        addSegment(seg);
+        if (seg.endAddress > moduleEnd)
+            moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+    }
     for (const auto &seg : ue_elf.segments())
     {
-        if (!seg.readable) continue;
+        addSegment(seg);
+        if (seg.endAddress > moduleEnd)
+            moduleEnd = static_cast<uintptr_t>(seg.endAddress);
+    }
+    for (const auto &map : KittyMemoryEx::getAllMaps(kMgr.processID()))
+    {
+        const bool isUELibMap =
+            map.pathname.find("libUE4.so") != std::string::npos ||
+            map.pathname.find("libUnreal.so") != std::string::npos;
+        const bool isAnonBss = map.pathname.find("[anon:.bss]") != std::string::npos;
+        const bool nearUnreal =
+            ue_elf.base() && map.startAddress >= ue_elf.base() &&
+            map.startAddress < (moduleEnd + 0x08000000ULL);
+
+        if ((isUELibMap && (map.readable || map.writeable)) || (isAnonBss && nearUnreal))
+            addSegment(map);
+    }
+
+    for (const auto &seg : searchSegments)
+    {
+        if (!(seg.readable || seg.writeable)) continue;
 
         for (size_t base = 0; base < seg.length; base += kChunk)
         {

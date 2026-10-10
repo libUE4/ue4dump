@@ -652,8 +652,10 @@ namespace
 
         SetDumpPhase("初始化内存");
         LOGI("正在初始化内存...");
-        if (!kMgr.initialize(candidate.pid, EK_MEM_OP_SYSCALL, false) &&
-            !kMgr.initialize(candidate.pid, EK_MEM_OP_IO, false))
+        // Android 上 linker 可能把 UE .bss 映射成 -w-p。process_vm_readv 会按
+        // PROT_READ 拒绝这类页，但 /proc/<pid>/mem(root) 仍可读取，所以优先 IO。
+        if (!kMgr.initialize(candidate.pid, EK_MEM_OP_IO, false) &&
+            !kMgr.initialize(candidate.pid, EK_MEM_OP_SYSCALL, false))
         {
             LOGE("初始化 KittyMemoryMgr 失败。");
             FinishProbeState(false, {}, {}, "ERROR_INIT_MEMORY");
@@ -986,6 +988,145 @@ namespace
         if (gWorkerThread.joinable())
             gWorkerThread.join();
         gWorkerThread = std::thread(ExecuteDumpUnrealLib, gCandidates[gSelectedIndex]);
+    }
+
+    void PrintHeadlessUsage()
+    {
+        std::printf("Usage:\n");
+        std::printf("  UnrealMemoryTools --list-processes\n");
+        std::printf("  UnrealMemoryTools --headless-dump <package>\n");
+    }
+
+    std::vector<AutoProcessCandidate> HeadlessCandidates()
+    {
+        auto candidates = FindAutoProcessCandidates();
+        if (candidates.empty())
+            LOGE("未检测到正在运行的 Unreal Engine 进程。");
+        return candidates;
+    }
+
+    std::vector<AutoProcessCandidate> HeadlessCandidatesForPackage(const std::string &package)
+    {
+        if (package.empty())
+            return HeadlessCandidates();
+
+        for (auto *profile : UE_Games)
+        {
+            for (const auto &pkg : profile->GetAppIDs())
+            {
+                if (pkg != package)
+                    continue;
+
+                auto pids = KittyMemoryEx::getPIDsOf(package);
+                std::vector<AutoProcessCandidate> candidates;
+                for (pid_t pid : pids)
+                    candidates.push_back({pid, package, profile->GetAppName(), true});
+                if (candidates.empty())
+                    LOGE("未找到正在运行的目标包名: %s", package.c_str());
+                return candidates;
+            }
+        }
+
+        return HeadlessCandidates();
+    }
+
+    int RunHeadlessListProcesses()
+    {
+        auto candidates = HeadlessCandidates();
+        for (const auto &candidate : candidates)
+        {
+            std::printf("%s\t%d\t%s\t%s\n",
+                        candidate.package.c_str(),
+                        candidate.pid,
+                        candidate.profileName.c_str(),
+                        candidate.dedicated ? "dedicated" : "auto");
+        }
+        return candidates.empty() ? 2 : 0;
+    }
+
+    bool SelectHeadlessCandidate(const std::string &package,
+                                 const std::vector<AutoProcessCandidate> &candidates,
+                                 AutoProcessCandidate &selected)
+    {
+        if (package.empty())
+        {
+            if (candidates.size() == 1)
+            {
+                selected = candidates.front();
+                return true;
+            }
+
+            LOGE("请指定包名；当前检测到 %zu 个候选。", candidates.size());
+            for (const auto &candidate : candidates)
+            {
+                LOGE("  %s (pid=%d, profile=%s)",
+                     candidate.package.c_str(), candidate.pid, candidate.profileName.c_str());
+            }
+            return false;
+        }
+
+        for (const auto &candidate : candidates)
+        {
+            if (candidate.package == package)
+            {
+                selected = candidate;
+                return true;
+            }
+        }
+
+        LOGE("未找到正在运行的目标包名: %s", package.c_str());
+        for (const auto &candidate : candidates)
+        {
+            LOGE("  候选: %s (pid=%d, profile=%s)",
+                 candidate.package.c_str(), candidate.pid, candidate.profileName.c_str());
+        }
+        return false;
+    }
+
+    int RunHeadlessDump(const std::string &package)
+    {
+        auto candidates = HeadlessCandidatesForPackage(package);
+        AutoProcessCandidate selected{};
+        if (!SelectHeadlessCandidate(package, candidates, selected))
+            return 2;
+
+        LOGI("[Headless] 目标包名: %s", selected.package.c_str());
+        LOGI("[Headless] 进程 ID: %d", selected.pid);
+        LOGI("[Headless] Profile: %s", selected.profileName.c_str());
+
+        ExecuteProbe(selected);
+        if (!gProbeResult.valid || !gProbeResult.success || !gProbeResult.profile)
+        {
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+                err = gDumpUiState.lastError;
+            }
+            LOGE("[Headless] 探针失败: %s", err.empty() ? "ERROR_PROBE_FAILED" : err.c_str());
+            return 3;
+        }
+
+        ExecuteDump(selected);
+
+        bool success = false;
+        std::string resultPath;
+        std::string lastError;
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            success = gDumpUiState.dumpSuccess;
+            resultPath = gDumpUiState.resultPath;
+            lastError = gDumpUiState.lastError;
+        }
+
+        if (!success)
+        {
+            LOGE("[Headless] Dump 失败: %s", lastError.empty() ? "ERROR_DUMP_FAILED" : lastError.c_str());
+            return 4;
+        }
+
+        LOGI("[Headless] Dump 完成: %s", resultPath.c_str());
+        std::printf("RESULT_PATH=%s\n", resultPath.c_str());
+        return 0;
     }
 } // namespace
 
@@ -1758,11 +1899,29 @@ void RenderAutoUEDumpPanel(bool *main_thread_flag)
 }
 
 
-int main()
+int main(int argc, char **argv)
 {
     setbuf(stdout, nullptr);
     setbuf(stderr, nullptr);
     setbuf(stdin, nullptr);
+
+    if (argc > 1)
+    {
+        const std::string arg = argv[1] ? argv[1] : "";
+        if (arg == "--help" || arg == "-h")
+        {
+            PrintHeadlessUsage();
+            return 0;
+        }
+        if (arg == "--list-processes")
+            return RunHeadlessListProcesses();
+        if (arg == "--headless-dump")
+            return RunHeadlessDump(argc > 2 && argv[2] ? argv[2] : "");
+
+        LOGE("未知参数: %s", arg.c_str());
+        PrintHeadlessUsage();
+        return 1;
+    }
 
     Logger::SetSink(LoggerSink);
     RefreshCandidates();
