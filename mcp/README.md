@@ -21,5 +21,5 @@ npm start
 
 1. `adb push` 最新 `outputs/arm64-v8a/UnrealMemoryTools`
 2. 在设备上执行 `UnrealMemoryTools --headless-dump <package>`
-3. 拉取 `/sdcard/UnrealMemoryTools/<package>` 到 `/root/辅助项目/dump`
-4. 对比 `/root/辅助项目/com.tencent.tmgp.dfm`
+3. 拉取 `/sdcard/UnrealMemoryTools/<package>` 到 `/root/workspace/dump`
+4. 对比 `/root/workspace/finished-dump/com.tencent.tmgp.dfm`

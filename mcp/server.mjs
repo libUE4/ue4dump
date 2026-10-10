@@ -10,8 +10,8 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
 const localBinary = path.join(repoRoot, "outputs", "arm64-v8a", "UnrealMemoryTools");
 const remoteBinary = "/data/local/tmp/UnrealMemoryTools";
 const defaultPackage = "com.tencent.tmgp.dfm";
-const localDumpDir = "/root/辅助项目/dump";
-const finishedDumpDir = "/root/辅助项目/com.tencent.tmgp.dfm";
+const localDumpDir = "/root/workspace/dump";
+const finishedDumpDir = "/root/workspace/finished-dump/com.tencent.tmgp.dfm";
 
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
