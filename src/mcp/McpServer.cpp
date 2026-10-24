@@ -204,6 +204,102 @@ bool HandleFrame(int clientFd, const std::string &line)
                                                        {"hex", hex}}.dump()));
         }
 
+        if (cmd == "DESCRIBE_CLASS")
+        {
+            if (!gHooks.describeClass)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 describeClass"));
+            const std::string className = args.value("className", "");
+            const std::string classAddress = args.value("classAddress", "");
+            if (className.empty() && classAddress.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "需提供 className 或 classAddress"));
+            const int maxFunctions = args.value("maxFunctions", 512);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.describeClass(className, classAddress, maxFunctions)));
+        }
+
+        if (cmd == "FIND_OBJECTS_BY_CLASS")
+        {
+            if (!gHooks.findObjects)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 findObjects"));
+            const std::string className = args.value("className", "");
+            const std::string classAddress = args.value("classAddress", "");
+            if (className.empty() && classAddress.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "需提供 className 或 classAddress"));
+            const int maxResults = args.value("maxResults", 100);
+            const bool skipDefaultObjects = args.value("skipDefaultObjects", true);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.findObjects(className, classAddress, maxResults, skipDefaultObjects)));
+        }
+
+        if (cmd == "READ_FIELD")
+        {
+            if (!gHooks.readField)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 readField"));
+            const std::string address = args.value("address", "");
+            const std::string field = args.value("field", "");
+            if (address.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "address 不能为空"));
+            if (field.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "field 不能为空"));
+            const int size = args.value("size", 0);
+            return SendLine(clientFd, OkReply(id, gHooks.readField(address, field, size)));
+        }
+
+        if (cmd == "WRITE_FIELD")
+        {
+            if (!gHooks.writeField)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 writeField"));
+            const std::string address = args.value("address", "");
+            const std::string field = args.value("field", "");
+            if (address.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "address 不能为空"));
+            if (field.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "field 不能为空"));
+            if (!args.contains("value"))
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "value 不能为空"));
+            const int size = args.value("size", 0);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.writeField(address, field, args["value"], size)));
+        }
+
+        if (cmd == "DUMP_OBJECT")
+        {
+            if (!gHooks.dumpObject)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 dumpObject"));
+            const std::string address = args.value("address", "");
+            if (address.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "address 不能为空"));
+            const int depth = args.value("depth", 1);
+            const bool direct = args.value("direct", false);
+            return SendLine(clientFd, OkReply(id, gHooks.dumpObject(address, depth, direct)));
+        }
+
+        if (cmd == "SEARCH_CLASSES")
+        {
+            if (!gHooks.searchClasses)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 searchClasses"));
+            const std::string filter = args.value("nameFilter", "");
+            if (filter.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "nameFilter 不能为空"));
+            const int maxResults = args.value("maxResults", 100);
+            const bool caseSensitive = args.value("caseSensitive", false);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.searchClasses(filter, maxResults, caseSensitive)));
+        }
+
+        if (cmd == "SEARCH_FIELDS")
+        {
+            if (!gHooks.searchFields)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 searchFields"));
+            const std::string filter = args.value("nameFilter", "");
+            if (filter.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "nameFilter 不能为空"));
+            const int maxResults = args.value("maxResults", 100);
+            const bool caseSensitive = args.value("caseSensitive", false);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.searchFields(filter, maxResults, caseSensitive)));
+        }
+
         if (cmd == "GET_LOGS")
         {
             if (!gHooks.getLogs)
@@ -223,6 +319,13 @@ bool HandleFrame(int clientFd, const std::string &line)
             if (gHooks.startDump) { caps.push_back("START_DUMP"); caps.push_back("DUMP_SDK"); }
             if (gHooks.dumpStatus) caps.push_back("GET_DUMP_STATUS");
             if (gHooks.readMemory) caps.push_back("MEMORY_READ");
+            if (gHooks.describeClass) caps.push_back("DESCRIBE_CLASS");
+            if (gHooks.findObjects) caps.push_back("FIND_OBJECTS_BY_CLASS");
+            if (gHooks.readField) caps.push_back("READ_FIELD");
+            if (gHooks.writeField) caps.push_back("WRITE_FIELD");
+            if (gHooks.dumpObject) caps.push_back("DUMP_OBJECT");
+            if (gHooks.searchClasses) caps.push_back("SEARCH_CLASSES");
+            if (gHooks.searchFields) caps.push_back("SEARCH_FIELDS");
             if (gHooks.getLogs) caps.push_back("GET_LOGS");
             caps.push_back("PING");
             caps.push_back("GET_CAPABILITIES");

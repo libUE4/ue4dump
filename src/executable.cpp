@@ -1301,6 +1301,768 @@ namespace
         return out;
     }
 
+    // ---- 反射层辅助：沿继承链按字段名解析偏移 ----
+    // READ_FIELD / WRITE_FIELD / DUMP_OBJECT 共用同一套解析，
+    // 避免三处各写一遍 Children 链遍历。
+    bool ResolveFieldOffset(UE_UObject obj, const std::string &fieldName,
+                            uintptr_t &offsetOut, int32_t &sizeOut,
+                            std::string &typeOut, std::string &declaredInOut)
+    {
+        UE_UClass cur = obj.GetClass();
+        for (int depth = 0; cur && depth < 64; ++depth)
+        {
+            // UE5：FField / FProperty 链
+            int fcap = 4096;
+            for (UE_FField ff = cur.GetChildProperties(); ff && fcap > 0; ff = ff.GetNext(), --fcap)
+            {
+                if (ff.GetName() != fieldName) continue;
+                UE_FProperty fp = ff.Cast<UE_FProperty>();
+                auto ft = fp.GetType();
+                offsetOut = static_cast<uintptr_t>(fp.GetOffset());
+                sizeOut = fp.GetSize();
+                typeOut = ft.second;
+                declaredInOut = cur.GetName();
+                return true;
+            }
+
+            // UE4：UField 链（属性与函数混装）
+            int cap = 4096;
+            for (UE_UField f = cur.GetChildren(); f && cap > 0; f = f.GetNext(), --cap)
+            {
+                UE_UObject asObject = f.Cast<UE_UObject>();
+                if (asObject.IsA(UE_UFunction::StaticClass())) continue;
+                if (asObject.IsA(UE_UStruct::StaticClass())) continue;
+                if (f.GetName() != fieldName) continue;
+
+                UE_UProperty up = f.Cast<UE_UProperty>();
+                auto t = up.GetType();
+                offsetOut = static_cast<uintptr_t>(up.GetOffset());
+                sizeOut = up.GetSize();
+                typeOut = t.second;
+                declaredInOut = cur.GetName();
+                return true;
+            }
+            cur = cur.GetSuper().Cast<UE_UClass>();
+        }
+        return false;
+    }
+
+    // 读目标进程内某个 UClass 的定义：属性 + 函数。
+    // UClass 的 Children 链混装 UFunction / UProperty / 嵌套 UStruct，
+    // 必须先判类型再分流，否则 UFunction 被当成 UProperty 读 Offset 是脏值。
+    std::string McpDescribeClass(const std::string &className, const std::string &classAddr, int maxFunctions)
+    {
+        auto *objects = UEWrappers::GetObjects();
+
+        UE_UClass cls;
+        if (!classAddr.empty())
+        {
+            uintptr_t addr = 0;
+            if (!ParseAddressText(classAddr, addr))
+                return nlohmann::json{{"ok", false}, {"error", "classAddress 格式无效"}}.dump();
+            cls = UE_UClass(reinterpret_cast<uint8_t *>(addr));
+        }
+        else if (!className.empty())
+        {
+            if (!objects)
+                return nlohmann::json{{"ok", false}, {"error", "对象数组未初始化，请先探针"}}.dump();
+            UE_UObject found = objects->FindObjectFast(className);
+            if (!found)
+                return nlohmann::json{{"ok", false}, {"error", "未找到类: " + className}}.dump();
+            if (!found.IsA(UE_UClass::StaticClass()))
+                return nlohmann::json{{"ok", false}, {"error", className + " 不是 UClass"}}.dump();
+            cls = found.Cast<UE_UClass>();
+        }
+        else
+        {
+            return nlohmann::json{{"ok", false}, {"error", "需提供 className 或 classAddress"}}.dump();
+        }
+
+        if (!cls)
+            return nlohmann::json{{"ok", false}, {"error", "无效的类地址"}}.dump();
+
+        nlohmann::json props = nlohmann::json::array();
+        nlohmann::json funcs = nlohmann::json::array();
+        int cap = 4096;
+
+        // UE5：FField / FProperty 链（只有属性，无函数）
+        for (UE_FField f = cls.GetChildProperties(); f && cap > 0; f = f.GetNext(), --cap)
+        {
+            UE_FProperty fp = f.Cast<UE_FProperty>();
+            auto t = fp.GetType();
+            props.push_back({{"name", f.GetName()},
+                             {"type", t.second},
+                             {"offset", fp.GetOffset()},
+                             {"size", fp.GetSize()},
+                             {"arrayDim", fp.GetArrayDim()},
+                             {"flags", static_cast<uint64_t>(fp.GetPropertyFlags())}});
+        }
+
+        // UE4：UField 链，混装 UFunction / UProperty / 嵌套 UStruct
+        if (maxFunctions < 1) maxFunctions = 512;
+        if (maxFunctions > 4096) maxFunctions = 4096;
+        for (UE_UField f = cls.GetChildren(); f && cap > 0; f = f.GetNext(), --cap)
+        {
+            UE_UObject asObject = f.Cast<UE_UObject>();
+
+            if (asObject.IsA(UE_UFunction::StaticClass()))
+            {
+                if (static_cast<int>(funcs.size()) >= maxFunctions)
+                    continue;
+
+                UE_UFunction fn = asObject.Cast<UE_UFunction>();
+
+                // 参数挂在函数自己的 Children 链上，同样是 UProperty
+                nlohmann::json params = nlohmann::json::array();
+                int pcap = 64;
+                for (UE_UField pf = fn.GetChildren(); pf && pcap > 0; pf = pf.GetNext(), --pcap)
+                {
+                    UE_UProperty p = pf.Cast<UE_UProperty>();
+                    auto pt = p.GetType();
+                    const uint64_t flags = static_cast<uint64_t>(p.GetPropertyFlags());
+                    char pAddr[32] = {};
+                    snprintf(pAddr, sizeof(pAddr), "0x%lx",
+                             static_cast<unsigned long>(reinterpret_cast<uintptr_t>(pf.GetAddress())));
+                    params.push_back({{"name", pf.GetName()},
+                                      {"type", pt.second},
+                                      {"offset", p.GetOffset()},
+                                      {"size", p.GetSize()},
+                                      {"isReturn", (flags & 0x0000000000000400ULL) != 0},
+                                      {"address", pAddr}});
+                }
+
+                char fnAddr[32] = {};
+                char nativeAddr[32] = {};
+                snprintf(fnAddr, sizeof(fnAddr), "0x%lx",
+                         static_cast<unsigned long>(reinterpret_cast<uintptr_t>(fn.GetAddress())));
+                snprintf(nativeAddr, sizeof(nativeAddr), "0x%lx",
+                         static_cast<unsigned long>(fn.GetFunc()));
+
+                funcs.push_back({{"name", fn.GetName()},
+                                 {"fullName", fn.GetFullName()},
+                                 {"address", fnAddr},
+                                 // Func 即 native 实现入口；蓝图函数可能为 0，需走 ProcessEvent
+                                 {"nativeFunc", nativeAddr},
+                                 {"numParams", static_cast<int>(fn.GetNumParams())},
+                                 {"paramSize", static_cast<int>(fn.GetParamSize())},
+                                 {"flags", fn.GetFunctionEFlags()},
+                                 {"params", params}});
+                continue;
+            }
+
+            if (asObject.IsA(UE_UStruct::StaticClass()))
+                continue;  // 嵌套结构体不算本类属性
+
+            UE_UProperty up = f.Cast<UE_UProperty>();
+            auto t = up.GetType();
+            props.push_back({{"name", f.GetName()},
+                             {"type", t.second},
+                             {"offset", up.GetOffset()},
+                             {"size", up.GetSize()},
+                             {"arrayDim", up.GetArrayDim()},
+                             {"flags", static_cast<uint64_t>(up.GetPropertyFlags())}});
+        }
+
+        UE_UStruct super = cls.GetSuper();
+        char clsAddr[32] = {};
+        snprintf(clsAddr, sizeof(clsAddr), "0x%lx",
+                 static_cast<unsigned long>(reinterpret_cast<uintptr_t>(cls.GetAddress())));
+
+        return nlohmann::json{{"ok", true},
+                              {"address", clsAddr},
+                              {"name", cls.GetName()},
+                              {"cppName", cls.GetCppName()},
+                              {"fullName", cls.GetFullName()},
+                              {"superName", super ? super.GetName() : ""},
+                              {"classSize", cls.GetSize()},
+                              {"propertyCount", static_cast<int>(props.size())},
+                              {"properties", props},
+                              {"functionCount", static_cast<int>(funcs.size())},
+                              {"functions", funcs}}.dump();
+    }
+
+    // 按类名或类地址枚举存活实例（对应 U3D 的 find_objects）
+    std::string McpFindObjects(const std::string &className, const std::string &classAddr,
+                               int maxResults, bool skipCdo)
+    {
+        auto *objects = UEWrappers::GetObjects();
+        if (!objects)
+            return nlohmann::json{{"ok", false}, {"error", "对象数组未初始化，请先探针"}}.dump();
+
+        UE_UClass target;
+        if (!classAddr.empty())
+        {
+            uintptr_t addr = 0;
+            if (!ParseAddressText(classAddr, addr))
+                return nlohmann::json{{"ok", false}, {"error", "classAddress 格式无效"}}.dump();
+            target = UE_UClass(reinterpret_cast<uint8_t *>(addr));
+            if (!target)
+                return nlohmann::json{{"ok", false}, {"error", "无效类地址"}}.dump();
+        }
+        else if (!className.empty())
+        {
+            UE_UObject found = objects->FindObjectFast(className);
+            if (!found)
+                return nlohmann::json{{"ok", false}, {"error", "未找到类: " + className}}.dump();
+            if (!found.IsA(UE_UClass::StaticClass()))
+                return nlohmann::json{{"ok", false}, {"error", className + " 不是 UClass"}}.dump();
+            target = found.Cast<UE_UClass>();
+        }
+        else
+        {
+            return nlohmann::json{{"ok", false}, {"error", "需提供 className 或 classAddress"}}.dump();
+        }
+
+        if (maxResults < 1) maxResults = 100;
+        if (maxResults > 2000) maxResults = 2000;
+
+        nlohmann::json arr = nlohmann::json::array();
+        objects->ForEachObjectOfClass(target, [&](UE_UObject obj) -> bool
+        {
+            if (static_cast<int>(arr.size()) >= maxResults)
+                return true;
+
+            // CDO 是类的模板对象，实例枚举通常应当排除
+            if (skipCdo && obj.HasFlags(EObjectFlags::ClassDefaultObject))
+                return false;
+
+            char addr[32] = {};
+            snprintf(addr, sizeof(addr), "0x%lx",
+                     static_cast<unsigned long>(reinterpret_cast<uintptr_t>(obj.GetAddress())));
+            UE_UClass oc = obj.GetClass();
+            UE_UObject outer = obj.GetOuter();
+            arr.push_back({{"address", addr},
+                           {"name", obj.GetName()},
+                           {"fullName", obj.GetFullName()},
+                           {"className", oc ? oc.GetName() : ""},
+                           {"outerName", outer ? outer.GetName() : ""},
+                           {"index", obj.GetIndex()}});
+            return false;
+        });
+
+        return nlohmann::json{{"ok", true},
+                              {"className", target.GetName()},
+                              {"count", static_cast<int>(arr.size())},
+                              {"truncated", static_cast<int>(arr.size()) >= maxResults},
+                              {"objects", arr}}.dump();
+    }
+
+    // 按名字模糊搜 UClass
+    std::string McpSearchClasses(const std::string &filter, int maxResults, bool caseSensitive)
+    {
+        auto *objects = UEWrappers::GetObjects();
+        if (!objects)
+            return nlohmann::json{{"ok", false}, {"error", "对象数组未初始化，请先探针"}}.dump();
+        if (filter.empty())
+            return nlohmann::json{{"ok", false}, {"error", "nameFilter 不能为空"}}.dump();
+
+        if (maxResults < 1) maxResults = 100;
+        if (maxResults > 1000) maxResults = 1000;
+
+        std::string needle = filter;
+        if (!caseSensitive)
+            std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+
+        nlohmann::json arr = nlohmann::json::array();
+        objects->ForEachObjectOfClass(UE_UClass::StaticClass(), [&](UE_UObject obj) -> bool
+        {
+            if (static_cast<int>(arr.size()) >= maxResults)
+                return true;
+
+            std::string name = obj.GetName();
+            std::string haystack = name;
+            if (!caseSensitive)
+                std::transform(haystack.begin(), haystack.end(), haystack.begin(), ::tolower);
+            if (haystack.find(needle) == std::string::npos)
+                return false;
+
+            char addr[32] = {};
+            snprintf(addr, sizeof(addr), "0x%lx",
+                     static_cast<unsigned long>(reinterpret_cast<uintptr_t>(obj.GetAddress())));
+            UE_UClass cls = obj.Cast<UE_UClass>();
+            UE_UStruct super = cls.GetSuper();
+            arr.push_back({{"address", addr},
+                           {"name", name},
+                           {"cppName", obj.GetCppName()},
+                           {"superName", super ? super.GetName() : ""},
+                           {"classSize", cls.GetSize()}});
+            return false;
+        });
+
+        return nlohmann::json{{"ok", true},
+                              {"nameFilter", filter},
+                              {"count", static_cast<int>(arr.size())},
+                              {"truncated", static_cast<int>(arr.size()) >= maxResults},
+                              {"results", arr}}.dump();
+    }
+
+    // 全局按字段名搜：扫所有 UClass 的 Children 链，报出「哪个类的哪个字段」。
+    // 用于「不知道字段叫什么在哪」时反查。
+    std::string McpSearchFields(const std::string &filter, int maxResults, bool caseSensitive)
+    {
+        auto *objects = UEWrappers::GetObjects();
+        if (!objects)
+            return nlohmann::json{{"ok", false}, {"error", "对象数组未初始化，请先探针"}}.dump();
+        if (filter.empty())
+            return nlohmann::json{{"ok", false}, {"error", "nameFilter 不能为空"}}.dump();
+
+        if (maxResults < 1) maxResults = 100;
+        if (maxResults > 1000) maxResults = 1000;
+
+        std::string needle = filter;
+        if (!caseSensitive)
+            std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+
+        nlohmann::json arr = nlohmann::json::array();
+        objects->ForEachObjectOfClass(UE_UClass::StaticClass(), [&](UE_UObject obj) -> bool
+        {
+            if (static_cast<int>(arr.size()) >= maxResults)
+                return true;
+
+            UE_UClass cls = obj.Cast<UE_UClass>();
+            if (!cls)
+                return false;
+
+            const std::string className = cls.GetName();
+
+            // UE5：FField / FProperty 链
+            int fcap = 2048;
+            for (UE_FField ff = cls.GetChildProperties(); ff && fcap > 0 &&
+                 static_cast<int>(arr.size()) < maxResults; ff = ff.GetNext(), --fcap)
+            {
+                std::string fieldName = ff.GetName();
+                std::string haystack = fieldName;
+                if (!caseSensitive)
+                    std::transform(haystack.begin(), haystack.end(), haystack.begin(), ::tolower);
+                if (haystack.find(needle) == std::string::npos)
+                    continue;
+
+                UE_FProperty fp = ff.Cast<UE_FProperty>();
+                auto ft = fp.GetType();
+                arr.push_back({{"className", className},
+                               {"field", fieldName},
+                               {"type", ft.second},
+                               {"offset", fp.GetOffset()},
+                               {"size", fp.GetSize()},
+                               {"arrayDim", fp.GetArrayDim()}});
+            }
+
+            int cap = 2048;
+            for (UE_UField f = cls.GetChildren(); f && cap > 0; f = f.GetNext(), --cap)
+            {
+                if (static_cast<int>(arr.size()) >= maxResults)
+                    return true;
+
+                UE_UObject asObject = f.Cast<UE_UObject>();
+                if (asObject.IsA(UE_UFunction::StaticClass())) continue;
+                if (asObject.IsA(UE_UStruct::StaticClass())) continue;
+
+                std::string fieldName = f.GetName();
+                std::string haystack = fieldName;
+                if (!caseSensitive)
+                    std::transform(haystack.begin(), haystack.end(), haystack.begin(), ::tolower);
+                if (haystack.find(needle) == std::string::npos)
+                    continue;
+
+                UE_UProperty up = f.Cast<UE_UProperty>();
+                auto t = up.GetType();
+                arr.push_back({{"className", className},
+                               {"field", fieldName},
+                               {"type", t.second},
+                               {"offset", up.GetOffset()},
+                               {"size", up.GetSize()},
+                               {"arrayDim", up.GetArrayDim()}});
+            }
+            return false;
+        });
+
+        return nlohmann::json{{"ok", true},
+                              {"nameFilter", filter},
+                              {"count", static_cast<int>(arr.size())},
+                              {"truncated", static_cast<int>(arr.size()) >= maxResults},
+                              {"results", arr}}.dump();
+    }
+
+    // 沿继承链按字段名反射定位偏移并读值（对应 U3D 的 read_field）
+    std::string McpReadField(const std::string &address, const std::string &fieldName, int sizeOverride)
+    {
+        uintptr_t addr = 0;
+        if (!ParseAddressText(address, addr))
+            return nlohmann::json{{"ok", false}, {"error", "address 格式无效"}}.dump();
+        if (fieldName.empty())
+            return nlohmann::json{{"ok", false}, {"error", "field 不能为空"}}.dump();
+
+        UE_UObject obj(reinterpret_cast<uint8_t *>(addr));
+        if (!obj)
+            return nlohmann::json{{"ok", false}, {"error", "无效对象地址"}}.dump();
+
+        uintptr_t fieldOffset = 0;
+        int32_t fieldSize = 0;
+        std::string fieldType;
+        std::string declaredIn;
+        if (!ResolveFieldOffset(obj, fieldName, fieldOffset, fieldSize, fieldType, declaredIn))
+            return nlohmann::json{{"ok", false},
+                                  {"error", "类及其父类链上未找到字段: " + fieldName}}.dump();
+
+        const uintptr_t fieldAddr = addr + fieldOffset;
+        int readSize = sizeOverride > 0 ? sizeOverride : (fieldSize > 0 ? fieldSize : 8);
+        if (readSize < 1) readSize = 1;
+        if (readSize > 4096) readSize = 4096;
+
+        std::vector<uint8_t> buf(static_cast<size_t>(readSize), 0);
+        if (UEMemory::kMgr.readMem(fieldAddr, buf.data(), static_cast<size_t>(readSize)) !=
+            static_cast<size_t>(readSize))
+        {
+            return nlohmann::json{{"ok", false}, {"error", "字段读取失败"}}.dump();
+        }
+
+        static const char *kHexDigits = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(static_cast<size_t>(readSize) * 3);
+        for (int i = 0; i < readSize; ++i)
+        {
+            hex.push_back(kHexDigits[(buf[i] >> 4) & 0xF]);
+            hex.push_back(kHexDigits[buf[i] & 0xF]);
+            hex.push_back(' ');
+        }
+
+        char fieldAddrText[32] = {};
+        snprintf(fieldAddrText, sizeof(fieldAddrText), "0x%lx",
+                 static_cast<unsigned long>(fieldAddr));
+
+        nlohmann::json out = {{"ok", true},
+                              {"address", address},
+                              {"field", fieldName},
+                              {"declaredIn", declaredIn},
+                              {"type", fieldType},
+                              {"offset", static_cast<uint64_t>(fieldOffset)},
+                              {"size", fieldSize},
+                              {"fieldAddress", fieldAddrText},
+                              {"hex", hex}};
+
+        // 按大小给出常见标量解读，避免调用方猜类型
+        switch (readSize)
+        {
+            case 1:
+            {
+                int8_t v = 0;
+                memcpy(&v, buf.data(), 1);
+                out["value"] = static_cast<int>(v);
+                break;
+            }
+            case 2:
+            {
+                int16_t v = 0;
+                memcpy(&v, buf.data(), 2);
+                out["value"] = static_cast<int>(v);
+                break;
+            }
+            case 4:
+            {
+                int32_t v = 0;
+                float fv = 0.0f;
+                memcpy(&v, buf.data(), 4);
+                memcpy(&fv, buf.data(), 4);
+                out["value"] = static_cast<int64_t>(v);
+                out["asFloat"] = fv;
+                break;
+            }
+            case 8:
+            {
+                int64_t v = 0;
+                double dv = 0.0;
+                uintptr_t pv = 0;
+                memcpy(&v, buf.data(), 8);
+                memcpy(&dv, buf.data(), 8);
+                memcpy(&pv, buf.data(), 8);
+                out["value"] = v;
+                out["asDouble"] = dv;
+                char ptrText[32] = {};
+                snprintf(ptrText, sizeof(ptrText), "0x%lx", static_cast<unsigned long>(pv));
+                out["asPtr"] = ptrText;
+                break;
+            }
+            default:
+                break;
+        }
+
+        return out.dump();
+    }
+
+    // 按字段名写值（对应 U3D 的 write_field）。
+    // 只支持定长标量与指针，不猜复杂类型。
+    std::string McpWriteField(const std::string &address, const std::string &fieldName,
+                              const nlohmann::json &value, int sizeOverride)
+    {
+        uintptr_t addr = 0;
+        if (!ParseAddressText(address, addr))
+            return nlohmann::json{{"ok", false}, {"error", "address 格式无效"}}.dump();
+        if (fieldName.empty())
+            return nlohmann::json{{"ok", false}, {"error", "field 不能为空"}}.dump();
+
+        UE_UObject obj(reinterpret_cast<uint8_t *>(addr));
+        if (!obj)
+            return nlohmann::json{{"ok", false}, {"error", "无效对象地址"}}.dump();
+
+        uintptr_t fieldOffset = 0;
+        int32_t fieldSize = 0;
+        std::string fieldType;
+        std::string declaredIn;
+        if (!ResolveFieldOffset(obj, fieldName, fieldOffset, fieldSize, fieldType, declaredIn))
+            return nlohmann::json{{"ok", false},
+                                  {"error", "类及其父类链上未找到字段: " + fieldName}}.dump();
+
+        int writeSize = sizeOverride > 0 ? sizeOverride : (fieldSize > 0 ? fieldSize : 4);
+        if (writeSize != 1 && writeSize != 2 && writeSize != 4 && writeSize != 8)
+            return nlohmann::json{{"ok", false},
+                                  {"error", "只支持 1/2/4/8 字节标量，当前字段大小 " +
+                                            std::to_string(fieldSize)}}.dump();
+
+        const uintptr_t fieldAddr = addr + fieldOffset;
+        std::vector<uint8_t> buf(static_cast<size_t>(writeSize), 0);
+
+        if (value.is_string())
+        {
+            uintptr_t ptr = 0;
+            if (!ParseAddressText(value.get<std::string>(), ptr))
+                return nlohmann::json{{"ok", false},
+                                      {"error", "字符串值需为地址（写指针）"}}.dump();
+            if (writeSize != 8)
+                return nlohmann::json{{"ok", false},
+                                      {"error", "指针只能写入 8 字节字段"}}.dump();
+            memcpy(buf.data(), &ptr, 8);
+        }
+        else if (value.is_number_integer())
+        {
+            const int64_t v = value.get<int64_t>();
+            switch (writeSize)
+            {
+                case 1: { int8_t t = static_cast<int8_t>(v); memcpy(buf.data(), &t, 1); break; }
+                case 2: { int16_t t = static_cast<int16_t>(v); memcpy(buf.data(), &t, 2); break; }
+                case 4: { int32_t t = static_cast<int32_t>(v); memcpy(buf.data(), &t, 4); break; }
+                case 8: { memcpy(buf.data(), &v, 8); break; }
+                default: break;
+            }
+        }
+        else if (value.is_number_float())
+        {
+            const double dv = value.get<double>();
+            if (writeSize == 4)
+            {
+                const float fv = static_cast<float>(dv);
+                memcpy(buf.data(), &fv, 4);
+            }
+            else if (writeSize == 8)
+            {
+                memcpy(buf.data(), &dv, 8);
+            }
+            else
+            {
+                return nlohmann::json{{"ok", false},
+                                      {"error", "浮点只能写入 4 或 8 字节字段"}}.dump();
+            }
+        }
+        else if (value.is_boolean())
+        {
+            buf[0] = value.get<bool>() ? 1 : 0;
+        }
+        else
+        {
+            return nlohmann::json{{"ok", false}, {"error", "不支持的 value 类型"}}.dump();
+        }
+
+        if (UEMemory::kMgr.writeMem(fieldAddr, buf.data(), static_cast<size_t>(writeSize)) !=
+            static_cast<size_t>(writeSize))
+        {
+            return nlohmann::json{{"ok", false}, {"error", "写入失败（权限或地址无效）"}}.dump();
+        }
+
+        return nlohmann::json{{"ok", true},
+                              {"address", address},
+                              {"field", fieldName},
+                              {"declaredIn", declaredIn},
+                              {"type", fieldType},
+                              {"offset", static_cast<uint64_t>(fieldOffset)},
+                              {"bytesWritten", writeSize}}.dump();
+    }
+
+    // 展开一个对象的字段值。depth 控制继承链收集层数，防卡死。
+    std::string McpDumpObject(const std::string &address, int depth, bool direct)
+    {
+        uintptr_t addr = 0;
+        if (!ParseAddressText(address, addr))
+            return nlohmann::json{{"ok", false}, {"error", "address 格式无效"}}.dump();
+
+        if (depth < 0) depth = 0;
+        if (depth > 4) depth = 4;
+
+        UE_UObject obj(reinterpret_cast<uint8_t *>(addr));
+        if (!obj)
+            return nlohmann::json{{"ok", false}, {"error", "无效对象地址"}}.dump();
+
+        UE_UClass cls = obj.GetClass();
+        nlohmann::json result;
+
+        char addrText[32] = {};
+        snprintf(addrText, sizeof(addrText), "0x%lx",
+                 static_cast<unsigned long>(reinterpret_cast<uintptr_t>(obj.GetAddress())));
+        result["ok"] = true;
+        result["address"] = addrText;
+        result["name"] = obj.GetName();
+        result["fullName"] = obj.GetFullName();
+        result["className"] = cls ? cls.GetName() : "";
+
+        nlohmann::json props = nlohmann::json::array();
+        int cap = 4096;
+
+        // depth=0 只读本类字段；depth>0 沿继承链向上收集
+        int maxDepth = direct ? 1 : (depth + 1);
+        UE_UClass cur = cls;
+
+        for (int d = 0; cur && d < maxDepth && d < 32 && cap > 0; ++d)
+        {
+            // UE5：属性挂在 FField / FProperty 链上（Children 链只有函数）
+            for (UE_FField ff = cur.GetChildProperties(); ff && cap > 0; ff = ff.GetNext(), --cap)
+            {
+                UE_FProperty fp = ff.Cast<UE_FProperty>();
+                auto ft = fp.GetType();
+                const int32_t foff = fp.GetOffset();
+                int32_t fsize = fp.GetSize();
+                if (foff < 0) continue;
+                if (fsize <= 0) fsize = static_cast<int32_t>(sizeof(uintptr_t));
+                if (fsize > 4096) continue;
+
+                const uintptr_t fAddr =
+                    reinterpret_cast<uintptr_t>(obj.GetAddress()) + static_cast<uintptr_t>(foff);
+
+                nlohmann::json fitem;
+                fitem["name"] = ff.GetName();
+                fitem["type"] = ft.second;
+                fitem["offset"] = foff;
+                fitem["size"] = fsize;
+                fitem["arrayDim"] = fp.GetArrayDim();
+                fitem["declaredIn"] = cur.GetName();
+
+                std::vector<uint8_t> fbuf(static_cast<size_t>(fsize), 0);
+                if (UEMemory::kMgr.readMem(fAddr, fbuf.data(), static_cast<size_t>(fsize)) !=
+                    static_cast<size_t>(fsize))
+                {
+                    fitem["error"] = "读取失败";
+                    props.push_back(fitem);
+                    continue;
+                }
+
+                switch (fsize)
+                {
+                    case 1: { int8_t v; memcpy(&v, fbuf.data(), 1); fitem["value"] = (int)v; break; }
+                    case 2: { int16_t v; memcpy(&v, fbuf.data(), 2); fitem["value"] = (int)v; break; }
+                    case 4:
+                    {
+                        int32_t v; float fv;
+                        memcpy(&v, fbuf.data(), 4);
+                        memcpy(&fv, fbuf.data(), 4);
+                        fitem["value"] = (int64_t)v;
+                        fitem["asFloat"] = fv;
+                        break;
+                    }
+                    case 8:
+                    {
+                        int64_t v; double dv; uintptr_t pv;
+                        memcpy(&v, fbuf.data(), 8);
+                        memcpy(&dv, fbuf.data(), 8);
+                        memcpy(&pv, fbuf.data(), 8);
+                        fitem["value"] = v;
+                        fitem["asDouble"] = dv;
+                        char pt[32] = {};
+                        snprintf(pt, sizeof(pt), "0x%lx", static_cast<unsigned long>(pv));
+                        fitem["asPtr"] = pt;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+
+                props.push_back(fitem);
+            }
+
+            // UE4：属性混在 UField 链上（与函数同链）
+            for (UE_UField f = cur.GetChildren(); f && cap > 0; f = f.GetNext(), --cap)
+            {
+                UE_UObject asObject = f.Cast<UE_UObject>();
+                if (asObject.IsA(UE_UFunction::StaticClass())) continue;
+                if (asObject.IsA(UE_UStruct::StaticClass())) continue;
+
+                UE_UProperty up = f.Cast<UE_UProperty>();
+                auto t = up.GetType();
+                const int32_t off = up.GetOffset();
+                int32_t psize = up.GetSize();
+                if (off < 0) continue;
+                // 部分 StructProperty/ObjectProperty 的 GetSize() 返 0，
+                // 退回按指针宽度读，否则会把整类字段都过滤掉。
+                if (psize <= 0) psize = static_cast<int32_t>(sizeof(uintptr_t));
+                if (psize > 4096) continue;
+
+                const uintptr_t fieldAddr =
+                    reinterpret_cast<uintptr_t>(obj.GetAddress()) + static_cast<uintptr_t>(off);
+
+                nlohmann::json item;
+                item["name"] = f.GetName();
+                item["type"] = t.second;
+                item["offset"] = off;
+                item["size"] = psize;
+                item["declaredIn"] = cur.GetName();
+
+                std::vector<uint8_t> buf(static_cast<size_t>(psize), 0);
+                if (UEMemory::kMgr.readMem(fieldAddr, buf.data(), static_cast<size_t>(psize)) !=
+                    static_cast<size_t>(psize))
+                {
+                    item["error"] = "读取失败";
+                    props.push_back(item);
+                    continue;
+                }
+
+                switch (psize)
+                {
+                    case 1: { int8_t v; memcpy(&v, buf.data(), 1); item["value"] = (int)v; break; }
+                    case 2: { int16_t v; memcpy(&v, buf.data(), 2); item["value"] = (int)v; break; }
+                    case 4:
+                    {
+                        int32_t v; float fv;
+                        memcpy(&v, buf.data(), 4);
+                        memcpy(&fv, buf.data(), 4);
+                        item["value"] = (int64_t)v;
+                        item["asFloat"] = fv;
+                        break;
+                    }
+                    case 8:
+                    {
+                        int64_t v; double dv; uintptr_t pv;
+                        memcpy(&v, buf.data(), 8);
+                        memcpy(&dv, buf.data(), 8);
+                        memcpy(&pv, buf.data(), 8);
+                        item["value"] = v;
+                        item["asDouble"] = dv;
+                        char ptrText[32] = {};
+                        snprintf(ptrText, sizeof(ptrText), "0x%lx",
+                                 static_cast<unsigned long>(pv));
+                        item["asPtr"] = ptrText;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+
+                props.push_back(item);
+            }
+            cur = cur.GetSuper().Cast<UE_UClass>();
+        }
+
+        result["propertyCount"] = static_cast<int>(props.size());
+        result["properties"] = props;
+        return result.dump();
+    }
+
+
     int RunMcpService(const std::string &bindOverride)
     {
         Ue4Mcp::HostHooks hooks;
@@ -1394,6 +2156,47 @@ namespace
         hooks.readMemory = [](const std::string &address, size_t size) -> std::string
         {
             return McpReadMemory(address, size);
+        };
+
+        hooks.describeClass = [](const std::string &className, const std::string &classAddress,
+                                 int maxFunctions) -> std::string
+        {
+            return McpDescribeClass(className, classAddress, maxFunctions);
+        };
+
+        hooks.findObjects = [](const std::string &className, const std::string &classAddress,
+                               int maxResults, bool skipDefaultObjects) -> std::string
+        {
+            return McpFindObjects(className, classAddress, maxResults, skipDefaultObjects);
+        };
+
+        hooks.readField = [](const std::string &address, const std::string &field,
+                             int size) -> std::string
+        {
+            return McpReadField(address, field, size);
+        };
+
+        hooks.writeField = [](const std::string &address, const std::string &field,
+                              const nlohmann::json &value, int size) -> std::string
+        {
+            return McpWriteField(address, field, value, size);
+        };
+
+        hooks.dumpObject = [](const std::string &address, int depth, bool direct) -> std::string
+        {
+            return McpDumpObject(address, depth, direct);
+        };
+
+        hooks.searchClasses = [](const std::string &filter, int maxResults,
+                                 bool caseSensitive) -> std::string
+        {
+            return McpSearchClasses(filter, maxResults, caseSensitive);
+        };
+
+        hooks.searchFields = [](const std::string &filter, int maxResults,
+                                bool caseSensitive) -> std::string
+        {
+            return McpSearchFields(filter, maxResults, caseSensitive);
         };
 
         hooks.getLogs = [](int maxLines) -> std::string
