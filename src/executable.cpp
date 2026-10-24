@@ -1792,8 +1792,16 @@ namespace
     // 按字段名写值（对应 U3D 的 write_field）。
     // 只支持定长标量与指针，不猜复杂类型。
     std::string McpWriteField(const std::string &address, const std::string &fieldName,
-                              const nlohmann::json &value, int sizeOverride)
+                              const nlohmann::json &value, int sizeOverride,
+                              bool confirmDangerous)
     {
+        // 写内存不可逆：写错地址会直接搞坏游戏进程，必须显式确认
+        if (!confirmDangerous)
+            return nlohmann::json{{"ok", false},
+                                  {"error", "写内存会直接修改目标进程。"
+                                            "请先用 READ_FIELD 确认地址与字段，"
+                                            "再传 confirmDangerous=true"}}.dump();
+
         uintptr_t addr = 0;
         if (!ParseAddressText(address, addr))
             return nlohmann::json{{"ok", false}, {"error", "address 格式无效"}}.dump();
@@ -1887,7 +1895,322 @@ namespace
     }
 
     // 展开一个对象的字段值。depth 控制继承链收集层数，防卡死。
-    std::string McpDumpObject(const std::string &address, int depth, bool direct)
+    // 解析字段路径：支持 "A.B.C" 与 "LocalPlayers[0].Pawn" 两种写法。
+    // 返回每级的字段名与数组下标。
+    struct FieldStep
+    {
+        std::string name;
+        int index = -1;  // >=0 时表示数组下标
+    };
+
+    bool ParseFieldPath(const std::string &path, std::vector<FieldStep> &out)
+    {
+        out.clear();
+        if (path.empty())
+            return false;
+
+        size_t begin = 0;
+        while (begin <= path.size())
+        {
+            size_t dot = path.find('.', begin);
+            std::string token = path.substr(begin, dot == std::string::npos ? std::string::npos
+                                                                           : dot - begin);
+            if (token.empty())
+                return false;
+
+            FieldStep step;
+            const size_t lb = token.find('[');
+            if (lb != std::string::npos)
+            {
+                const size_t rb = token.find(']', lb);
+                if (rb == std::string::npos)
+                    return false;
+                step.name = token.substr(0, lb);
+                step.index = std::atoi(token.substr(lb + 1, rb - lb - 1).c_str());
+                if (step.index < 0)
+                    return false;
+            }
+            else
+            {
+                step.name = token;
+            }
+            if (step.name.empty())
+                return false;
+            out.push_back(step);
+
+            if (dot == std::string::npos)
+                break;
+            begin = dot + 1;
+        }
+        return !out.empty();
+    }
+
+    // 指针链追踪：从 base 开始逐级按字段名取指针，可选数组下标。
+    // 每级都返回地址、字段类型与指针值，方便定位哪一级断了。
+    std::string McpFollowChain(const std::string &baseAddress, const std::vector<std::string> &fields)
+    {
+        uintptr_t current = 0;
+        if (!ParseAddressText(baseAddress, current))
+            return nlohmann::json{{"ok", false}, {"error", "baseAddress 格式无效"}}.dump();
+        if (fields.empty())
+            return nlohmann::json{{"ok", false}, {"error", "fields 不能为空"}}.dump();
+
+        nlohmann::json steps = nlohmann::json::array();
+
+        auto addrText = [](uintptr_t v) -> std::string
+        {
+            char buf[32] = {};
+            snprintf(buf, sizeof(buf), "0x%lx", static_cast<unsigned long>(v));
+            return std::string(buf);
+        };
+
+        for (size_t i = 0; i < fields.size(); ++i)
+        {
+            std::vector<FieldStep> path;
+            if (!ParseFieldPath(fields[i], path))
+            {
+                steps.push_back({{"step", static_cast<int>(i)},
+                                 {"field", fields[i]},
+                                 {"error", "字段路径解析失败"}});
+                return nlohmann::json{{"ok", false},
+                                      {"baseAddress", baseAddress},
+                                      {"steps", steps},
+                                      {"brokenAtStep", static_cast<int>(i)}}.dump();
+            }
+
+            // 一个字段路径里可能有多段（A.B），逐段推进 current
+            bool broken = false;
+            for (const auto &step : path)
+            {
+                UE_UObject obj(reinterpret_cast<uint8_t *>(current));
+                if (!obj)
+                {
+                    steps.push_back({{"step", static_cast<int>(i)},
+                                     {"field", step.name},
+                                     {"error", "当前地址不是有效 UObject"},
+                                     {"atAddress", addrText(current)}});
+                    broken = true;
+                    break;
+                }
+
+                uintptr_t off = 0;
+                int32_t fsize = 0;
+                std::string ftype;
+                std::string declaredIn;
+                if (!ResolveFieldOffset(obj, step.name, off, fsize, ftype, declaredIn))
+                {
+                    steps.push_back({{"step", static_cast<int>(i)},
+                                     {"field", step.name},
+                                     {"error", "字段未找到"},
+                                     {"atAddress", addrText(current)}});
+                    broken = true;
+                    break;
+                }
+
+                const uintptr_t fieldAddr = current + off;
+
+                // 数组下标：按元素宽度推进
+                uintptr_t readAddr = fieldAddr;
+                if (step.index >= 0)
+                    readAddr = fieldAddr + static_cast<uintptr_t>(step.index) * sizeof(uintptr_t);
+
+                uintptr_t next = 0;
+                if (UEMemory::kMgr.readMem(readAddr, &next, sizeof(next)) != sizeof(next))
+                {
+                    steps.push_back({{"step", static_cast<int>(i)},
+                                     {"field", step.name},
+                                     {"error", "读取失败"},
+                                     {"atAddress", addrText(readAddr)}});
+                    broken = true;
+                    break;
+                }
+
+                steps.push_back({{"step", static_cast<int>(i)},
+                                 {"field", step.name},
+                                 {"type", ftype},
+                                 {"declaredIn", declaredIn},
+                                 {"offset", static_cast<uint64_t>(off)},
+                                 {"fieldAddress", addrText(fieldAddr)},
+                                 {"value", addrText(next)},
+                                 {"valid", next >= 0x10000}});
+
+                if (next < 0x10000)
+                {
+                    broken = true;
+                    break;
+                }
+                current = next;
+            }
+
+            if (broken)
+                return nlohmann::json{{"ok", false},
+                                      {"baseAddress", baseAddress},
+                                      {"steps", steps},
+                                      {"brokenAtStep", static_cast<int>(i)}}.dump();
+        }
+
+        nlohmann::json result = {{"ok", true},
+                                 {"baseAddress", baseAddress},
+                                 {"steps", steps},
+                                 {"finalAddress", addrText(current)}};
+
+        UE_UObject finalObj(reinterpret_cast<uint8_t *>(current));
+        if (finalObj)
+        {
+            result["finalName"] = finalObj.GetName();
+            result["finalFullName"] = finalObj.GetFullName();
+            UE_UClass fc = finalObj.GetClass();
+            result["finalClassName"] = fc ? fc.GetName() : "";
+        }
+        return result.dump();
+    }
+
+    // 读并解读一个字段的值，含 TArray 与结构体展开。
+    // arrayLimit / structLimit 控制展开规模，防止一次 dump 打出几万行。
+    nlohmann::json DecodeFieldValue(uintptr_t valueAddr, int32_t size,
+                                    UEPropertyType propType, const std::string &typeName,
+                                    int arrayLimit, int structLimit)
+    {
+        nlohmann::json item;
+
+        // ---- TArray<T>：Data(8) + Num(4) + Max(4) = 16 字节 ----
+        if (propType == UEPropertyType::ArrayProperty)
+        {
+            uint8_t raw[16] = {};
+            if (UEMemory::kMgr.readMem(valueAddr, raw, sizeof(raw)) != sizeof(raw))
+            {
+                item["error"] = "TArray 头读取失败";
+                return item;
+            }
+            uintptr_t dataPtr = 0;
+            int32_t num = 0;
+            int32_t max = 0;
+            memcpy(&dataPtr, raw, 8);
+            memcpy(&num, raw + 8, 4);
+            memcpy(&max, raw + 12, 4);
+
+            char dataText[32] = {};
+            snprintf(dataText, sizeof(dataText), "0x%lx", static_cast<unsigned long>(dataPtr));
+            item["arrayData"] = dataText;
+            item["arrayNum"] = num;
+            item["arrayMax"] = max;
+
+            // 常见情形：TArray<UObject*> —— 元素就是 8 字节指针
+            const bool pointerElements =
+                typeName.find("TArray<struct UObject") != std::string::npos ||
+                typeName.find("TArray<class UObject") != std::string::npos ||
+                typeName.find("UObject*>") != std::string::npos;
+
+            if (pointerElements && num > 0 && arrayLimit > 0)
+            {
+                const int n = std::min(num, arrayLimit);
+                nlohmann::json elements = nlohmann::json::array();
+                for (int i = 0; i < n; ++i)
+                {
+                    uintptr_t elem = 0;
+                    if (UEMemory::kMgr.readMem(dataPtr + static_cast<uintptr_t>(i) * 8,
+                                               &elem, 8) != 8)
+                        break;
+                    if (elem < 0x10000)
+                        continue;
+
+                    nlohmann::json e;
+                    char eAddr[32] = {};
+                    snprintf(eAddr, sizeof(eAddr), "0x%lx", static_cast<unsigned long>(elem));
+                    e["address"] = eAddr;
+
+                    UE_UObject elemObj(reinterpret_cast<uint8_t *>(elem));
+                    if (elemObj)
+                    {
+                        e["name"] = elemObj.GetName();
+                        UE_UClass ec = elemObj.GetClass();
+                        e["className"] = ec ? ec.GetName() : "";
+                    }
+                    elements.push_back(e);
+                }
+                item["elements"] = elements;
+                item["elementsShown"] = static_cast<int>(elements.size());
+            }
+            return item;
+        }
+
+        // ---- 结构体内联展开（FVector / FEncVector 等）----
+        if (propType == UEPropertyType::StructProperty && size > 8 && size <= 256 &&
+            structLimit > 0)
+        {
+            // 按 4 字节浮点切分，这是 FVector / FRotator 最常见的形态
+            const int comps = std::min(size / 4, structLimit);
+            nlohmann::json raw = nlohmann::json::array();
+            std::vector<uint8_t> buf(static_cast<size_t>(size), 0);
+            if (UEMemory::kMgr.readMem(valueAddr, buf.data(), buf.size()) != buf.size())
+            {
+                item["error"] = "结构体读取失败";
+                return item;
+            }
+            for (int i = 0; i < comps; ++i)
+            {
+                float fv = 0.0f;
+                int32_t iv = 0;
+                memcpy(&fv, buf.data() + i * 4, 4);
+                memcpy(&iv, buf.data() + i * 4, 4);
+                // 浮点合理范围优先，否则按整数报
+                if (std::isfinite(fv) && std::fabs(fv) < 1e7f && std::fabs(fv) > 1e-6f)
+                    raw.push_back(fv);
+                else
+                    raw.push_back(iv);
+            }
+            item["components"] = raw;
+            return item;
+        }
+
+        // ---- 标量 ----
+        if (size <= 0 || size > 4096)
+        {
+            item["error"] = "字段大小异常";
+            return item;
+        }
+
+        std::vector<uint8_t> buf(static_cast<size_t>(size), 0);
+        if (UEMemory::kMgr.readMem(valueAddr, buf.data(), buf.size()) != buf.size())
+        {
+            item["error"] = "读取失败";
+            return item;
+        }
+
+        switch (size)
+        {
+            case 1: { int8_t v; memcpy(&v, buf.data(), 1); item["value"] = (int)v; break; }
+            case 2: { int16_t v; memcpy(&v, buf.data(), 2); item["value"] = (int)v; break; }
+            case 4:
+            {
+                int32_t v; float fv;
+                memcpy(&v, buf.data(), 4);
+                memcpy(&fv, buf.data(), 4);
+                item["value"] = (int64_t)v;
+                item["asFloat"] = fv;
+                break;
+            }
+            case 8:
+            {
+                int64_t v; double dv; uintptr_t pv;
+                memcpy(&v, buf.data(), 8);
+                memcpy(&dv, buf.data(), 8);
+                memcpy(&pv, buf.data(), 8);
+                item["value"] = v;
+                item["asDouble"] = dv;
+                char pt[32] = {};
+                snprintf(pt, sizeof(pt), "0x%lx", static_cast<unsigned long>(pv));
+                item["asPtr"] = pt;
+                break;
+            }
+            default:
+                break;
+        }
+        return item;
+    }
+
+    std::string McpDumpObject(const std::string &address, int depth, bool direct,
+                              int arrayLimit, int structLimit)
     {
         uintptr_t addr = 0;
         if (!ParseAddressText(address, addr))
@@ -1943,46 +2266,14 @@ namespace
                 fitem["arrayDim"] = fp.GetArrayDim();
                 fitem["declaredIn"] = cur.GetName();
 
-                std::vector<uint8_t> fbuf(static_cast<size_t>(fsize), 0);
-                if (UEMemory::kMgr.readMem(fAddr, fbuf.data(), static_cast<size_t>(fsize)) !=
-                    static_cast<size_t>(fsize))
-                {
-                    fitem["error"] = "读取失败";
-                    props.push_back(fitem);
-                    continue;
-                }
-
-                switch (fsize)
-                {
-                    case 1: { int8_t v; memcpy(&v, fbuf.data(), 1); fitem["value"] = (int)v; break; }
-                    case 2: { int16_t v; memcpy(&v, fbuf.data(), 2); fitem["value"] = (int)v; break; }
-                    case 4:
-                    {
-                        int32_t v; float fv;
-                        memcpy(&v, fbuf.data(), 4);
-                        memcpy(&fv, fbuf.data(), 4);
-                        fitem["value"] = (int64_t)v;
-                        fitem["asFloat"] = fv;
-                        break;
-                    }
-                    case 8:
-                    {
-                        int64_t v; double dv; uintptr_t pv;
-                        memcpy(&v, fbuf.data(), 8);
-                        memcpy(&dv, fbuf.data(), 8);
-                        memcpy(&pv, fbuf.data(), 8);
-                        fitem["value"] = v;
-                        fitem["asDouble"] = dv;
-                        char pt[32] = {};
-                        snprintf(pt, sizeof(pt), "0x%lx", static_cast<unsigned long>(pv));
-                        fitem["asPtr"] = pt;
-                        break;
-                    }
-                    default:
-                        break;
-                }
+                // TArray / 结构体 / 标量统一走 DecodeFieldValue
+                nlohmann::json decoded = DecodeFieldValue(
+                    fAddr, fsize, ft.first, ft.second, arrayLimit, structLimit);
+                for (auto it = decoded.begin(); it != decoded.end(); ++it)
+                    fitem[it.key()] = it.value();
 
                 props.push_back(fitem);
+                continue;
             }
 
             // UE4：属性混在 UField 链上（与函数同链）
@@ -2012,45 +2303,10 @@ namespace
                 item["size"] = psize;
                 item["declaredIn"] = cur.GetName();
 
-                std::vector<uint8_t> buf(static_cast<size_t>(psize), 0);
-                if (UEMemory::kMgr.readMem(fieldAddr, buf.data(), static_cast<size_t>(psize)) !=
-                    static_cast<size_t>(psize))
-                {
-                    item["error"] = "读取失败";
-                    props.push_back(item);
-                    continue;
-                }
-
-                switch (psize)
-                {
-                    case 1: { int8_t v; memcpy(&v, buf.data(), 1); item["value"] = (int)v; break; }
-                    case 2: { int16_t v; memcpy(&v, buf.data(), 2); item["value"] = (int)v; break; }
-                    case 4:
-                    {
-                        int32_t v; float fv;
-                        memcpy(&v, buf.data(), 4);
-                        memcpy(&fv, buf.data(), 4);
-                        item["value"] = (int64_t)v;
-                        item["asFloat"] = fv;
-                        break;
-                    }
-                    case 8:
-                    {
-                        int64_t v; double dv; uintptr_t pv;
-                        memcpy(&v, buf.data(), 8);
-                        memcpy(&dv, buf.data(), 8);
-                        memcpy(&pv, buf.data(), 8);
-                        item["value"] = v;
-                        item["asDouble"] = dv;
-                        char ptrText[32] = {};
-                        snprintf(ptrText, sizeof(ptrText), "0x%lx",
-                                 static_cast<unsigned long>(pv));
-                        item["asPtr"] = ptrText;
-                        break;
-                    }
-                    default:
-                        break;
-                }
+                nlohmann::json decoded = DecodeFieldValue(
+                    fieldAddr, psize, t.first, t.second, arrayLimit, structLimit);
+                for (auto it = decoded.begin(); it != decoded.end(); ++it)
+                    item[it.key()] = it.value();
 
                 props.push_back(item);
             }
@@ -2177,14 +2433,22 @@ namespace
         };
 
         hooks.writeField = [](const std::string &address, const std::string &field,
-                              const nlohmann::json &value, int size) -> std::string
+                              const nlohmann::json &value, int size,
+                              bool confirmDangerous) -> std::string
         {
-            return McpWriteField(address, field, value, size);
+            return McpWriteField(address, field, value, size, confirmDangerous);
         };
 
-        hooks.dumpObject = [](const std::string &address, int depth, bool direct) -> std::string
+        hooks.dumpObject = [](const std::string &address, int depth, bool direct,
+                              int arrayLimit, int structLimit) -> std::string
         {
-            return McpDumpObject(address, depth, direct);
+            return McpDumpObject(address, depth, direct, arrayLimit, structLimit);
+        };
+
+        hooks.followChain = [](const std::string &baseAddress,
+                               const std::vector<std::string> &fields) -> std::string
+        {
+            return McpFollowChain(baseAddress, fields);
         };
 
         hooks.searchClasses = [](const std::string &filter, int maxResults,

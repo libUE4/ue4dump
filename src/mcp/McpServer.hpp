@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -55,10 +56,16 @@ struct HostHooks
 
     // 按字段名写值（整型 / 浮点 / 指针）
     std::function<std::string(const std::string &address, const std::string &field,
-                              const nlohmann::json &value, int size)> writeField;
+                              const nlohmann::json &value, int size,
+                              bool confirmDangerous)> writeField;
 
-    // 展开对象字段值
-    std::function<std::string(const std::string &address, int depth, bool direct)> dumpObject;
+    // 展开对象字段值（含 TArray / 结构体）
+    std::function<std::string(const std::string &address, int depth, bool direct,
+                              int arrayLimit, int structLimit)> dumpObject;
+
+    // 指针链追踪
+    std::function<std::string(const std::string &baseAddress,
+                              const std::vector<std::string> &fields)> followChain;
 
     // 按名字模糊搜 UClass
     std::function<std::string(const std::string &filter, int maxResults,

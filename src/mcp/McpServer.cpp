@@ -258,8 +258,9 @@ bool HandleFrame(int clientFd, const std::string &line)
             if (!args.contains("value"))
                 return SendLine(clientFd, ErrReply(id, kBadArgs, "value 不能为空"));
             const int size = args.value("size", 0);
+            const bool confirmDangerous = args.value("confirmDangerous", false);
             return SendLine(clientFd, OkReply(id,
-                gHooks.writeField(address, field, args["value"], size)));
+                gHooks.writeField(address, field, args["value"], size, confirmDangerous)));
         }
 
         if (cmd == "DUMP_OBJECT")
@@ -271,7 +272,29 @@ bool HandleFrame(int clientFd, const std::string &line)
                 return SendLine(clientFd, ErrReply(id, kBadArgs, "address 不能为空"));
             const int depth = args.value("depth", 1);
             const bool direct = args.value("direct", false);
-            return SendLine(clientFd, OkReply(id, gHooks.dumpObject(address, depth, direct)));
+            const int arrayLimit = args.value("arrayLimit", 16);
+            const int structLimit = args.value("structLimit", 8);
+            return SendLine(clientFd, OkReply(id,
+                gHooks.dumpObject(address, depth, direct, arrayLimit, structLimit)));
+        }
+
+        if (cmd == "FOLLOW_POINTER_CHAIN")
+        {
+            if (!gHooks.followChain)
+                return SendLine(clientFd, ErrReply(id, kNotReady, "宿主未提供 followChain"));
+            const std::string baseAddress = args.value("baseAddress", "");
+            if (baseAddress.empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "baseAddress 不能为空"));
+            if (!args.contains("fields") || !args["fields"].is_array() || args["fields"].empty())
+                return SendLine(clientFd, ErrReply(id, kBadArgs, "fields 须为非空字符串数组"));
+            std::vector<std::string> fields;
+            for (const auto &f : args["fields"])
+            {
+                if (!f.is_string())
+                    return SendLine(clientFd, ErrReply(id, kBadArgs, "fields 元素须为字符串"));
+                fields.push_back(f.get<std::string>());
+            }
+            return SendLine(clientFd, OkReply(id, gHooks.followChain(baseAddress, fields)));
         }
 
         if (cmd == "SEARCH_CLASSES")
@@ -324,6 +347,7 @@ bool HandleFrame(int clientFd, const std::string &line)
             if (gHooks.readField) caps.push_back("READ_FIELD");
             if (gHooks.writeField) caps.push_back("WRITE_FIELD");
             if (gHooks.dumpObject) caps.push_back("DUMP_OBJECT");
+            if (gHooks.followChain) caps.push_back("FOLLOW_POINTER_CHAIN");
             if (gHooks.searchClasses) caps.push_back("SEARCH_CLASSES");
             if (gHooks.searchFields) caps.push_back("SEARCH_FIELDS");
             if (gHooks.getLogs) caps.push_back("GET_LOGS");
