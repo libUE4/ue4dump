@@ -1,3 +1,4 @@
 build/
+build_arm64/
 outputs/
 mcp/node_modules/

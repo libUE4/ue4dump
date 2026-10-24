@@ -35,6 +35,10 @@
 #include "Android_draw/draw.h"
 #include "Android_Graphics/GraphicsManager.h"
 
+#include "mcp/McpServer.hpp"
+
+#include <nlohmann/json.hpp>
+
 std::vector<IGameProfile *> UE_Games = {
     new ArenaBreakoutProfile(),
     new DeltaForceProfile(),
@@ -995,6 +999,7 @@ namespace
         std::printf("Usage:\n");
         std::printf("  UnrealMemoryTools --list-processes\n");
         std::printf("  UnrealMemoryTools --headless-dump <package>\n");
+        std::printf("  UnrealMemoryTools --mcp [bindAddress]\n");
     }
 
     std::vector<AutoProcessCandidate> HeadlessCandidates()
@@ -1127,6 +1132,289 @@ namespace
         LOGI("[Headless] Dump 完成: %s", resultPath.c_str());
         std::printf("RESULT_PATH=%s\n", resultPath.c_str());
         return 0;
+    }
+
+    // ---- MCP 服务：把工具能力暴露给 AI 客户端 ----
+    // 探针/dump 都是重活，放后台线程跑；命令立即返回“已开始”，
+    // 由 GET_PROBE_STATUS / GET_DUMP_STATUS 轮询进度。
+    struct McpSelection
+    {
+        pid_t pid = 0;
+        std::string package;
+        std::string profileName;
+    };
+
+    McpSelection gMcpSelection;
+
+    bool ResolveMcpSelection(McpSelection &out)
+    {
+        if (gMcpSelection.pid > 0)
+        {
+            out = gMcpSelection;
+            return true;
+        }
+
+        if (!gMcpSelection.package.empty())
+        {
+            auto candidates = HeadlessCandidatesForPackage(gMcpSelection.package);
+            for (const auto &c : candidates)
+            {
+                out = {c.pid, c.package, c.profileName};
+                return true;
+            }
+            return false;
+        }
+
+        auto candidates = HeadlessCandidates();
+        if (candidates.empty())
+            return false;
+        out = {candidates.front().pid, candidates.front().package, candidates.front().profileName};
+        return true;
+    }
+
+    std::string McpStartProbe(int pid, const std::string &package)
+    {
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            if (gDumpUiState.probeRunning || gDumpUiState.dumpRunning)
+            {
+                return nlohmann::json{{"ok", false},
+                                      {"phase", gDumpUiState.phase},
+                                      {"started", false}}.dump();
+            }
+        }
+
+        if (pid > 0 || !package.empty())
+            gMcpSelection = {pid, package, ""};
+
+        McpSelection selected{};
+        if (!ResolveMcpSelection(selected))
+            return nlohmann::json{{"ok", false}, {"started", false},
+                                  {"error", "目标进程未找到"}}.dump();
+
+        if (gWorkerThread.joinable())
+            gWorkerThread.join();
+
+        gProbeResult = ProbeResult{};
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            gDumpUiState.probeRunning = true;
+            gDumpUiState.probeFinished = false;
+            gDumpUiState.probeSuccess = false;
+            gDumpUiState.lastError.clear();
+            gDumpUiState.phase = "探针中";
+            gDumpUiState.activePackage = selected.package;
+        }
+
+        gWorkerThread = std::thread([selected]()
+        {
+            LOGI("[MCP] 开始探针: %s (pid=%d)", selected.package.c_str(), selected.pid);
+            AutoProcessCandidate candidate{};
+            candidate.pid = selected.pid;
+            candidate.package = selected.package;
+            candidate.profileName = selected.profileName;
+            ExecuteProbe(candidate);
+        });
+
+        return nlohmann::json{{"ok", true},
+                              {"started", true},
+                              {"pid", selected.pid},
+                              {"package", selected.package},
+                              {"profileName", selected.profileName}}.dump();
+    }
+
+    std::string McpStartDump()
+    {
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            if (gDumpUiState.dumpRunning)
+            {
+                return nlohmann::json{{"ok", false}, {"started", false},
+                                      {"error", "dump 已在进行中"}}.dump();
+            }
+            if (!gProbeResult.valid || !gProbeResult.profile)
+            {
+                return nlohmann::json{{"ok", false}, {"started", false},
+                                      {"error", "请先 START_PROBE 完成探针"}}.dump();
+            }
+        }
+
+        AutoProcessCandidate candidate{};
+        candidate.pid = gProbeResult.pid;
+        candidate.package = gProbeResult.package;
+        candidate.profileName = gProbeResult.profileName;
+
+        if (gWorkerThread.joinable())
+            gWorkerThread.join();
+
+        gWorkerThread = std::thread([candidate]()
+        {
+            LOGI("[MCP] 开始 Dump: %s", candidate.package.c_str());
+            ExecuteDump(candidate);
+        });
+
+        return nlohmann::json{{"ok", true},
+                              {"started", true},
+                              {"package", candidate.package}}.dump();
+    }
+
+    // 解析 "0x7c1040f000" / "7c1040f000" 两种地址写法
+    bool ParseAddressText(const std::string &text, uintptr_t &out)
+    {
+        if (text.empty())
+            return false;
+
+        const char *begin = text.c_str();
+        if (begin[0] == '0' && (begin[1] == 'x' || begin[1] == 'X'))
+            begin += 2;
+        if (*begin == '\0')
+            return false;
+
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long long value = std::strtoull(begin, &end, 16);
+        if (errno != 0 || end == begin || *end != '\0')
+            return false;
+
+        out = static_cast<uintptr_t>(value);
+        return true;
+    }
+
+    std::string McpReadMemory(const std::string &address, size_t size)
+    {
+        uintptr_t addr = 0;
+        if (!ParseAddressText(address, addr))
+            return "";
+
+        std::vector<uint8_t> buf(size, 0);
+        if (UEMemory::kMgr.readMem(addr, buf.data(), size) != size)
+            return "";
+
+        static const char *kHex = "0123456789abcdef";
+        std::string out;
+        out.reserve(size * 2);
+        for (uint8_t byte : buf)
+        {
+            out.push_back(kHex[(byte >> 4) & 0xF]);
+            out.push_back(kHex[byte & 0xF]);
+        }
+        return out;
+    }
+
+    int RunMcpService(const std::string &bindOverride)
+    {
+        Ue4Mcp::HostHooks hooks;
+
+        hooks.buildVersion = []() { return std::string(kUEDUMPER_VERSION); };
+
+        hooks.listProcesses = []() -> std::string
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto &c : HeadlessCandidates())
+            {
+                arr.push_back({{"pid", c.pid},
+                               {"package", c.package},
+                               {"profileName", c.profileName},
+                               {"dedicated", c.dedicated}});
+            }
+            return nlohmann::json{{"processes", arr}}.dump();
+        };
+
+        hooks.selectProcess = [](int pid, const std::string &package) -> std::string
+        {
+            gMcpSelection = {pid, package, ""};
+            return nlohmann::json{{"selected", true},
+                                  {"pid", pid},
+                                  {"package", package}}.dump();
+        };
+
+        hooks.startProbe = [](int pid, const std::string &package) -> std::string
+        {
+            return McpStartProbe(pid, package);
+        };
+
+        hooks.probeStatus = []() -> std::string
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            return nlohmann::json{{"running", gDumpUiState.probeRunning},
+                                  {"finished", gDumpUiState.probeFinished},
+                                  {"success", gDumpUiState.probeSuccess},
+                                  {"phase", gDumpUiState.phase},
+                                  {"package", gDumpUiState.activePackage},
+                                  {"lastError", gDumpUiState.lastError}}.dump();
+        };
+
+        hooks.probeResults = []() -> std::string
+        {
+            if (!gProbeResult.valid)
+                return nlohmann::json{{"ok", false}, {"error", "探针未完成"}}.dump();
+
+            nlohmann::json offsets = nlohmann::json::array();
+            for (const auto &entry : gProbeResult.offsets)
+            {
+                char valueHex[32] = {};
+                char relHex[32] = {};
+                snprintf(valueHex, sizeof(valueHex), "0x%lx",
+                         static_cast<unsigned long>(entry.value));
+                snprintf(relHex, sizeof(relHex), "0x%lx",
+                         static_cast<unsigned long>(entry.relative));
+                offsets.push_back({{"name", entry.name},
+                                   {"value", valueHex},
+                                   {"relative", relHex},
+                                   {"found", entry.found}});
+            }
+
+            char baseHex[32] = {};
+            snprintf(baseHex, sizeof(baseHex), "0x%lx",
+                     static_cast<unsigned long>(gProbeResult.baseAddress));
+
+            return nlohmann::json{{"ok", true},
+                                  {"pid", gProbeResult.pid},
+                                  {"package", gProbeResult.package},
+                                  {"profileName", gProbeResult.profileName},
+                                  {"baseAddress", baseHex},
+                                  {"offsets", offsets}}.dump();
+        };
+
+        hooks.startDump = []() -> std::string { return McpStartDump(); };
+
+        hooks.dumpStatus = []() -> std::string
+        {
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            return nlohmann::json{{"running", gDumpUiState.dumpRunning},
+                                  {"finished", gDumpUiState.dumpFinished},
+                                  {"success", gDumpUiState.dumpSuccess},
+                                  {"phase", gDumpUiState.phase},
+                                  {"objectsPercent", gDumpUiState.objectsPercent},
+                                  {"dumpPercent", gDumpUiState.dumpPercent},
+                                  {"resultPath", gDumpUiState.resultPath},
+                                  {"lastError", gDumpUiState.lastError}}.dump();
+        };
+
+        hooks.readMemory = [](const std::string &address, size_t size) -> std::string
+        {
+            return McpReadMemory(address, size);
+        };
+
+        hooks.getLogs = [](int maxLines) -> std::string
+        {
+            if (maxLines < 1) maxLines = 20;
+            if (maxLines > 500) maxLines = 500;
+
+            nlohmann::json lines = nlohmann::json::array();
+            std::lock_guard<std::mutex> lock(gDumpUiState.mutex);
+            const int total = static_cast<int>(gDumpUiState.logLines.size());
+            const int begin = total > maxLines ? total - maxLines : 0;
+            for (int i = begin; i < total; ++i)
+                lines.push_back(gDumpUiState.logLines[static_cast<size_t>(i)]);
+            return nlohmann::json{{"lines", lines}}.dump();
+        };
+
+        Ue4Mcp::InstallHooks(std::move(hooks));
+
+        LOGI("[MCP] 准备就绪，监听 %s",
+             bindOverride.empty() ? "127.0.0.1:35515" : bindOverride.c_str());
+        return Ue4Mcp::Run(bindOverride, 35515);
     }
 } // namespace
 
@@ -1917,6 +2205,8 @@ int main(int argc, char **argv)
             return RunHeadlessListProcesses();
         if (arg == "--headless-dump")
             return RunHeadlessDump(argc > 2 && argv[2] ? argv[2] : "");
+        if (arg == "--mcp")
+            return RunMcpService(argc > 2 && argv[2] ? argv[2] : "");
 
         LOGE("未知参数: %s", arg.c_str());
         PrintHeadlessUsage();
